@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(cat)",
+      "Bash(rm src/_typecheck_scratch.ts)",
+      "Bash(curl -s http://localhost:5183/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5183/src/main.ts)",
+      "Bash(curl -s http://localhost:5183/src/main.ts)",
+      "Bash(curl -s -o /dev/null -w \"index: %{http_code}\\\\n\" http://localhost:5183/)",
+      "Bash(curl -s http://localhost:5183/src/pages/deck.ts -o /tmp/deck_out.js -w \"deck.ts: %{http_code}\\\\n\")",
+      "Bash(npm install *)",
+      "Bash(npx vitest *)",
+      "Bash(curl -s http://localhost:5183/src/main.ts -o /tmp/main_out.js -w \"main.ts: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:5183/src/pages/session.ts -o /tmp/session_out.js -w \"session.ts: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:5183/src/lib/profiles.ts -o /tmp/profiles_out.js -w \"profiles.ts: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:5183/src/pages/session.ts -o /tmp/session_out2.js -w \"session.ts: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:5183/src/main.ts -o /tmp/main_out2.js -w \"main.ts: %{http_code}\\\\n\")",
+      "Bash(curl -s http://localhost:5183/src/pages/book.ts -o /tmp/book_out.js -w \"book.ts: %{http_code}\\\\n\")",
+      "Bash(grep -n \"// ---------- audio\\\\|// ---------- swipe\" src/pages/session.ts)",
+      "Bash(mkdir -p public)",
+      "Bash(mv inspire-1_livre-de-l-eleve_audio public/)",
+      "PowerShell(Move-Item -Path \"inspire-1_livre-de-l-eleve_audio\" -Destination \"public\\\\inspire-1_livre-de-l-eleve_audio\" -ErrorAction Stop)",
+      "Bash(curl -s -o /dev/null -w \"audio file: %{http_code}\\\\n\" \"http://localhost:5184/inspire-1_livre-de-l-eleve_audio/inspire-1_livre-de-l-eleve_audio/INSP1_LE_Piste001.mp3\")"
+    ]
+  }
+}
