@@ -1,15 +1,25 @@
 import { esc, toast } from './dom';
 
-// Adjust this if your audio folder structure differs.
-const AUDIO_BASE_PATH = '/inspire-1_livre-de-l-eleve_audio/inspire-1_livre-de-l-eleve_audio';
+// Generic audio folder for any imported source's tracks — no publisher-
+// specific subfolder or filename convention. Override via VITE_AUDIO_BASE_PATH
+// if your deployment serves audio from somewhere else.
+const AUDIO_BASE_PATH = (import.meta.env.VITE_AUDIO_BASE_PATH as string | undefined) ?? '/audio';
 
-function pisteNumbers(code: string): string[] {
+/**
+ * A track "code" is either a full path/URL (used as-is) or a bare track id
+ * — multiple ids can be hyphen- or comma-separated for multi-track
+ * documents (e.g. "036-037"). Bare ids are resolved to "<base>/<id>.mp3"; no
+ * assumptions about a specific textbook's naming convention.
+ */
+function trackIds(code: string): string[] {
   return String(code)
-    .split(/[^0-9]+/)
+    .split(/[,/]|(?<=\d)-(?=\d)/)
+    .map((s) => s.trim())
     .filter(Boolean);
 }
-function pistePath(num: string): string {
-  return `${AUDIO_BASE_PATH}/INSP1_LE_Piste${num.padStart(3, '0')}.mp3`;
+function trackPath(id: string): string {
+  if (/^https?:\/\//.test(id) || id.startsWith('/')) return id;
+  return `${AUDIO_BASE_PATH}/${id}.mp3`;
 }
 function formatAudioTime(t: number): string {
   if (!isFinite(t) || isNaN(t) || t < 0) return '0:00';
@@ -38,7 +48,7 @@ export function playCardAudio(code: string, btnEl: HTMLElement): void {
 
   if (alreadyOpenHere) return;
 
-  const tracks = pisteNumbers(code);
+  const tracks = trackIds(code);
   const holder = document.createElement('div') as AudioHolder;
   holder.className = 'audio-holder';
   const trackPicker =
@@ -57,7 +67,7 @@ export function playCardAudio(code: string, btnEl: HTMLElement): void {
   btnEl.insertAdjacentElement('afterend', holder);
   btnEl.classList.add('playing');
 
-  const audioEl = new Audio(pistePath(tracks[0]));
+  const audioEl = new Audio(trackPath(tracks[0]));
   audioEl.preload = 'auto';
   holder._audioEl = audioEl;
 
@@ -129,7 +139,7 @@ export function playCardAudio(code: string, btnEl: HTMLElement): void {
       holder.querySelectorAll('.audio-track-btn').forEach((x) => x.classList.remove('on'));
       tb.classList.add('on');
       audioEl.pause();
-      audioEl.src = pistePath(tb.dataset.n!);
+      audioEl.src = trackPath(tb.dataset.n!);
       audioEl.play().catch(() => {});
     });
   });

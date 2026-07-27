@@ -2,7 +2,12 @@ import { supabase } from './supabase';
 import { scheduleCard } from './fsrs';
 import type { Card, CardWithNote, Deck, Note, NoteFields, NoteType, Rating } from '../types';
 
-const NOTES_SELECT = 'fields,note_type,tags';
+// The page_blocks/import_pages embed is only ever non-null for a note
+// compiled from an import (source_block_id set) — see sendPageBlocksToPractice
+// in pageExtractions.ts. Live-referenced, not snapshotted: relies on the
+// querying user passing page_blocks' own RLS (admin + import owner), which
+// holds today because the same person creates and studies their imports.
+const NOTES_SELECT = 'fields,note_type,tags,source_block_id,page_blocks(*,import_pages(rendered_page_path))';
 
 /** One card to import: optional note_type/tags, plus the note's fields (front/back/etc). */
 export type ImportItem = Partial<Pick<Note, 'note_type' | 'tags'>> & NoteFields;

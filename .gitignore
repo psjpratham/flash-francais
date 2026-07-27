@@ -23,3 +23,13 @@ dist-ssr
 *.sln
 *.sw?
 .env
+supabase/functions/.env
+supabase/functions/.env.*
+!supabase/functions/.env.example
+
+# Local Claude Code project settings can accumulate API keys in Bash
+# permission allowlist entries (e.g. curl commands with real tokens).
+# Keep this untracked; shared permissions belong in settings.local.json
+# (already gitignored by Claude Code convention) or a sanitized version
+# added back deliberately.
+.claude/settings.json

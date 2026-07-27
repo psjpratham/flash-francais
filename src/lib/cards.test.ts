@@ -61,6 +61,8 @@ function testDeck(overrides: Partial<Deck> = {}): Deck {
     review_per_day: 20,
     new_per_day: 10,
     desired_retention: 0.9,
+    visibility: 'personal',
+    status: 'published',
     created_at: new Date().toISOString(),
     ...overrides,
   };

@@ -6,6 +6,8 @@ import type { CardWithNote, Deck, DeckStatsWithStreak, NoteFields, Rating } from
 import { $, esc, errMsg, toast } from '../lib/dom';
 import { barRow } from './statsPanel';
 import { PROFILES, type ChipAs, type ProfileChip } from '../lib/profiles';
+import { renderReadModeBlock, wireReadModeBlock } from '../lib/readModeRenderers';
+import { getRenderedPageUrl } from '../lib/pageRender';
 
 export interface SessionDeps {
   onEnd: () => void;
@@ -71,6 +73,25 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
   let dragging = false;
   let moved = false;
 
+  // Cards compiled from an imported page_block (see sendPageBlocksToPractice)
+  // carry their source page's rendered_page_path — signed URLs for every
+  // distinct path in this queue are fetched once up front rather than per
+  // card, since createSignedUrl is a network call and the same page image is
+  // typically reused by several cards in a row.
+  const pageImageUrls = new Map<string, string>();
+  void preloadPageImages();
+  async function preloadPageImages(): Promise<void> {
+    const paths = [...new Set(queue.map((c) => c.notes.page_blocks?.import_pages?.rendered_page_path).filter((p): p is string => !!p))];
+    if (!paths.length) return;
+    try {
+      const entries = await Promise.all(paths.map(async (p) => [p, await getRenderedPageUrl(p)] as const));
+      for (const [p, url] of entries) pageImageUrls.set(p, url);
+      render(); // harmless if the learner already moved past the cards these were for
+    } catch {
+      // Best-effort — an imported card just renders without its page image if signing fails.
+    }
+  }
+
   void loadDeckStats();
   async function loadDeckStats(): Promise<void> {
     try {
@@ -133,6 +154,19 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       </aside>`;
   }
 
+  /** The same split page-image + rendered-card layout the admin review UI uses, reused here so an imported card studies exactly like it reads. */
+  function importedCardBodyHTML(sourceBlock: NonNullable<CardWithNote['notes']['page_blocks']>): string {
+    const imagePath = sourceBlock.import_pages?.rendered_page_path ?? null;
+    const imageUrl = imagePath ? pageImageUrls.get(imagePath) : null;
+    return `
+      <div class="session-imported-split">
+        <div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>
+        <div class="session-imported-right">
+          ${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original page">` : '<div class="p-text">Page image not available.</div>'}
+        </div>
+      </div>`;
+  }
+
   function render(): void {
     const total = queue.length;
 
@@ -148,9 +182,16 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     const front = fields.front || fields.Front || '—';
     const back = fields.back || fields.Back || '—';
     const isGenerated = (notes.tags || []).includes('generated');
+    // A card compiled from an imported page_block (see sendPageBlocksToPractice)
+    // has nothing meaningful to hide behind a "reveal" step — it's read, not
+    // guessed — so it always renders already-flipped, straight into grading,
+    // reusing the same split page-image view the review UI shows.
+    const sourceBlock = notes.page_blocks;
+    if (sourceBlock) flipped = true;
+    const importedFaceHTML = sourceBlock ? importedCardBodyHTML(sourceBlock) : '';
 
     container.innerHTML = `
-      <div class="session-layout">
+      <div class="session-layout ${sourceBlock ? 'session-layout-wide' : ''}">
         ${sidebarHTML()}
         <div class="session">
           <div class="sess-top">
@@ -161,7 +202,11 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
 
           <div class="zone" id="zone">
             <div class="verdict" id="verdict"><span id="verdictTxt"></span></div>
-            <div class="card ${flipped ? 'flipped' : ''}" id="card">
+            <div class="card ${flipped ? 'flipped' : ''} ${sourceBlock ? 'session-card-imported' : ''}" id="card">
+              ${
+                sourceBlock
+                  ? `<div class="face front">${importedFaceHTML}</div><div class="face back">${importedFaceHTML}</div>`
+                  : `
               <div class="face front">
                 <div class="ctype">${esc(notes.note_type)}</div>
                 ${isGenerated ? '<div class="gtype">✨ AI-written</div>' : ''}
@@ -177,7 +222,8 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
                   <div class="word small">${esc(front)}</div>
                   <div class="gloss">${esc(back)}</div>
                 </div>
-              </div>
+              </div>`
+              }
             </div>
           </div>
 
@@ -221,8 +267,12 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       $(container, '#gradeHard').addEventListener('click', () => void grade(2));
       $(container, '#gradeGood').addEventListener('click', () => void grade(3));
       $(container, '#gradeEasy').addEventListener('click', () => void grade(4));
-      buildChips(profile.chips, fields);
-      if (openChipIndex != null) openPanel(visibleChips[openChipIndex], fields);
+      if (sourceBlock) {
+        container.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => wireReadModeBlock(sourceBlock, el));
+      } else {
+        buildChips(profile.chips, fields);
+        if (openChipIndex != null) openPanel(visibleChips[openChipIndex], fields);
+      }
     } else {
       $(container, '#flipBtn').addEventListener('click', flip);
     }

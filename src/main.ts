@@ -1,27 +1,36 @@
 import './style.css';
 import type { Session } from '@supabase/supabase-js';
-import { getSession, onAuthChange, signOut } from './lib/auth';
+import { getMyRole, getSession, onAuthChange, signOut } from './lib/auth';
 import { loadQueueForDeck } from './lib/cards';
 import { renderAuth } from './pages/auth';
 import { renderLibrary } from './pages/library';
 import { renderDeckDetail } from './pages/deck';
 import { renderSession } from './pages/session';
-import { renderBookList, renderBookReader } from './pages/book';
+import { renderPageReview } from './pages/pageReview';
+import { renderImportContent } from './pages/import';
+import { renderImportDetail } from './pages/importDetail';
+import { initAccentKeyboard } from './lib/accentKeyboard';
 import { $, errMsg, esc, toast } from './lib/dom';
-import type { BookLesson, CardWithNote, DeckWithCounts } from './types';
+import type { CardWithNote, DeckWithCounts } from './types';
 
 const app = $(document, '#app');
 const topRight = $(document, '#topRight');
+
+initAccentKeyboard();
 
 type View =
   | { name: 'library' }
   | { name: 'deck'; deckId: string }
   | { name: 'session'; deck: DeckWithCounts; queue: CardWithNote[] }
-  | { name: 'book-list'; deckId: string }
-  | { name: 'book-reader'; deckId: string; lesson: BookLesson };
+  | { name: 'page-review'; deckId: string; deckName: string; importId: string | null }
+  | { name: 'import'; deckId: string; deckName: string }
+  /** The durable, permanent home for one import — always a real import_id, never "the latest". */
+  | { name: 'import-detail'; deckId: string; deckName: string; importId: string };
 let view: View = { name: 'library' };
 let wasAuthenticated = false;
 let disposeSession: (() => void) | null = null;
+let disposeImportDetail: (() => void) | null = null;
+let isAdmin = false;
 
 function renderHeader(session: Session | null, due?: number, streak?: number): void {
   if (!session) {
@@ -54,6 +63,8 @@ async function startSession(session: Session, deck: DeckWithCounts, tagFilter: s
 function renderView(session: Session): void {
   disposeSession?.();
   disposeSession = null;
+  disposeImportDetail?.();
+  disposeImportDetail = null;
   if (view.name === 'library') {
     void renderLibrary(app, {
       onOpenDeck: (deckId) => {
@@ -73,8 +84,17 @@ function renderView(session: Session): void {
         renderView(session);
       },
       onStartSession: (deck, tagFilter) => void startSession(session, deck, tagFilter),
-      onReadBook: () => {
-        view = { name: 'book-list', deckId };
+      onOpenImport: (id, name, importId) => {
+        view = { name: 'import-detail', deckId: id, deckName: name, importId };
+        renderView(session);
+      },
+      currentUserId: session.user.id,
+      onDeleted: () => {
+        view = { name: 'library' };
+        renderView(session);
+      },
+      onImportContent: (id, name) => {
+        view = { name: 'import', deckId: id, deckName: name };
         renderView(session);
       },
     });
@@ -94,13 +114,12 @@ function renderView(session: Session): void {
     });
     return;
   }
-  if (view.name === 'book-list') {
-    const deckId = view.deckId;
-    void renderBookList(app, {
-      onOpenLesson: (lesson) => {
-        view = { name: 'book-reader', deckId, lesson };
-        renderView(session);
-      },
+  if (view.name === 'page-review') {
+    const { deckId, deckName, importId } = view;
+    void renderPageReview(app, {
+      deckId,
+      deckName,
+      importId,
       onBack: () => {
         view = { name: 'deck', deckId };
         renderView(session);
@@ -108,12 +127,41 @@ function renderView(session: Session): void {
     });
     return;
   }
-  const bookDeckId = view.deckId;
-  renderBookReader(app, view.lesson, {
+  if (view.name === 'import-detail') {
+    const { deckId, deckName, importId } = view;
+    disposeImportDetail = renderImportDetail(app, {
+      deckId,
+      deckName,
+      importId,
+      isAdmin,
+      onBack: () => {
+        view = { name: 'deck', deckId };
+        renderView(session);
+      },
+      onOpenPageReview: (id) => {
+        view = { name: 'page-review', deckId, deckName, importId: id };
+        renderView(session);
+      },
+    });
+    return;
+  }
+  const importDeckId = view.deckId;
+  const importDeckName = view.deckName;
+  renderImportContent(app, {
     onBack: () => {
-      view = { name: 'book-list', deckId: bookDeckId };
+      view = { name: 'deck', deckId: importDeckId };
       renderView(session);
     },
+    // Persist-and-hand-off: the moment an import exists server-side, jump
+    // straight to its durable route — there is no "in-progress upload"
+    // state left in this view for a reload to lose.
+    onImportCreated: (importId) => {
+      view = { name: 'import-detail', deckId: importDeckId, deckName: importDeckName, importId };
+      renderView(session);
+    },
+    deckId: view.deckId,
+    deckName: view.deckName,
+    isAdmin,
   });
 }
 
@@ -131,6 +179,15 @@ function route(session: Session | null): void {
   }
   if (wasAuthenticated) return; // token refresh etc. — keep whatever page is already showing
   wasAuthenticated = true;
+  isAdmin = false;
+  getMyRole()
+    .then((role) => {
+      isAdmin = role === 'admin';
+      if (view.name === 'library') renderView(session);
+    })
+    .catch(() => {
+      /* not fatal — the import entry point just stays hidden */
+    });
   renderView(session);
 }
 
