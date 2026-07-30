@@ -1,6 +1,6 @@
 import { listDecksWithCounts, createDeck, fetchDeckStats } from '../lib/decks';
 import type { DeckStatsWithStreak, DeckWithCounts } from '../types';
-import { $, esc, errMsg, toast } from '../lib/dom';
+import { $, esc, errMsg, openModal, toast } from '../lib/dom';
 import { accuracyPct, statsMoreHTML } from './statsPanel';
 
 export interface LibraryDeps {
@@ -27,7 +27,7 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
           decks.length
             ? `<div class="due-banner">
                  <div><h2>${totalDue()} cards waiting</h2><p>Across all decks</p></div>
-                 <button id="studyAllBtn">Study everything due</button>
+                 <button id="studyAllBtn">▶ Practice everything due</button>
                </div>`
             : ''
         }
@@ -54,29 +54,75 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
         </div>
       </div>`,
         )
-        .join('') + `<div class="course add-course" id="addDeckBtn">+ New deck</div>`;
+        .join('') + `<div class="course add-course" id="addDeckBtn"><span class="plus">+</span>New deck</div>`;
 
     grid.querySelectorAll<HTMLElement>('.course[data-id]').forEach((el) => {
       el.addEventListener('click', () => deps.onOpenDeck(el.dataset.id!));
     });
-    $(grid, '#addDeckBtn').addEventListener('click', () => void addDeck());
+    $(grid, '#addDeckBtn').addEventListener('click', addDeck);
     if (decks.length) {
       $(container, '#studyAllBtn').addEventListener('click', deps.onStudyAll);
     }
     wireStats();
   }
 
-  async function addDeck(): Promise<void> {
-    const name = prompt('Deck name:');
-    if (!name?.trim()) return;
-    try {
-      await createDeck(name.trim());
-      toast('Deck created');
-      await loadDecks();
-      render();
-    } catch (e) {
-      toast('Could not create deck: ' + errMsg(e));
+  function addDeck(): void {
+    const { box, close } = openModal(`
+      <h3>Create a new deck</h3>
+      <div class="field"><label>Deck name</label><input id="newDeckName" placeholder="e.g. Unit 4 — Sorties"></div>
+      <div class="field">
+        <label>Visibility</label>
+        <div class="visibility-choice">
+          <button type="button" class="visibility-option on" data-visibility="personal">
+            <span class="vo-icon">🔒</span><span class="vo-label">Private</span><span class="vo-desc">Only you can see it</span>
+          </button>
+          <button type="button" class="visibility-option" data-visibility="shared" disabled>
+            <span class="vo-icon">🌍</span><span class="vo-label">Public</span><span class="vo-desc">Searchable by anyone — coming soon</span>
+          </button>
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn-sec" id="cancelCreateBtn">Cancel</button>
+        <button class="btn-primary" id="confirmCreateBtn" style="width:auto">Create deck</button>
+      </div>
+    `);
+
+    const nameInput = $<HTMLInputElement>(box, '#newDeckName');
+    nameInput.focus();
+
+    box.querySelectorAll<HTMLButtonElement>('.visibility-option').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.disabled) {
+          toast('Public decks are coming soon');
+          return;
+        }
+        box.querySelectorAll('.visibility-option').forEach((b) => b.classList.remove('on'));
+        btn.classList.add('on');
+      });
+    });
+
+    async function submitCreate(): Promise<void> {
+      const name = nameInput.value.trim();
+      if (!name) {
+        toast('Enter a deck name');
+        return;
+      }
+      try {
+        await createDeck(name);
+        toast('Deck created');
+        close();
+        await loadDecks();
+        render();
+      } catch (e) {
+        toast('Could not create deck: ' + errMsg(e));
+      }
     }
+
+    $(box, '#cancelCreateBtn').addEventListener('click', close);
+    $(box, '#confirmCreateBtn').addEventListener('click', () => void submitCreate());
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') void submitCreate();
+    });
   }
 
   async function loadDecks(): Promise<void> {
@@ -114,7 +160,7 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
   function statsHTML(data: DeckStatsWithStreak): string {
     return `
       <div class="panelbox">
-        <h3>Your stats</h3>
+        <h3>📊 Your stats</h3>
         <div class="stat-grid">
           <div class="stat-item"><div class="stat-v">${data.reviews.today}</div><div class="stat-k">reviewed today</div></div>
           <div class="stat-item"><div class="stat-v">${accuracyPct(data.ratingsToday)}%</div><div class="stat-k">accuracy today</div></div>

@@ -1,9 +1,8 @@
 import { bulkInsertNotesAndCards } from '../lib/cards';
 import type { ImportItem } from '../lib/cards';
 import { classifyImportError } from '../lib/importErrors';
-import { createImport, createImportFileRecord, enqueuePreprocessing, IMPORT_SOURCES, updateImportFileStatus, uploadImportSourceFile } from '../lib/imports';
+import { createImport, createImportFileRecord, createPromptOnlyImport, enqueuePreprocessing, IMPORT_SOURCES, updateImportFileStatus, uploadImportSourceFile } from '../lib/imports';
 import { STAGE, type ImportProgress } from '../lib/importProgress';
-import type { ImportSourceType } from '../types';
 import { $, errMsg, esc, toast } from '../lib/dom';
 import { renderImportProgress } from './importProgressView';
 
@@ -14,20 +13,77 @@ export interface ImportContentDeps {
   onImportCreated: (importId: string) => void;
   deckId: string;
   deckName: string;
-  /** Gates the "Textbook PDF" option — creating an import row requires admin, same as RLS enforces server-side. */
+  /** Gates the source+prompt composer — creating an import row requires admin, same as RLS enforces server-side. */
   isAdmin: boolean;
 }
 
-type Mode = 'loading' | 'chooser' | 'textbook' | 'cards';
+type Mode = 'chooser' | 'cards' | 'anki';
 type CardsTab = 'paste' | 'json' | 'manual';
 
+type SourceKind = 'image' | 'pdf' | 'doc';
+
 /**
- * Deck-scoped "Import content" flow: either starts a brand new textbook
- * import (upload -> enqueue preprocessing -> hand off to the durable
- * import-detail route immediately) or the cards/JSON quick-add flow.
- * Existing/in-flight textbook imports are never resumed here — that's the
- * deck's "Document imports" list + the import-detail page's job, driven by
- * a real import_id, never "whatever this flow last touched".
+ * 'faithful': reproduce the source exactly, no prompt, cards never get
+ * front/back/answers unless an attached answer key (corrigé) covers a given
+ * exercise. 'prompt': describe how to shape the cards — always required
+ * (attaching a source with no prompt is no longer "faithful by default",
+ * it's just incomplete) — see handleComposerSend.
+ */
+type ExtractionMode = 'faithful' | 'prompt';
+
+const SOURCE_PILLS: { kind: SourceKind; icon: string; label: string; accept: string }[] = [
+  { kind: 'image', icon: '🖼️', label: 'Image', accept: 'image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif' },
+  { kind: 'pdf', icon: '📄', label: 'PDF', accept: 'application/pdf,.pdf' },
+  { kind: 'doc', icon: '📝', label: 'Text/Doc', accept: 'text/plain,.txt,.doc,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+];
+
+const CORRIGE_ACCEPT = 'application/pdf,.pdf,image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif';
+
+const PROMPT_SUGGESTIONS = [
+  'Make vocabulary flashcards from this',
+  'Create fill-in-the-blank practice from this',
+  'Focus on the key grammar rules',
+  'Turn this into short quiz questions',
+];
+
+/** Best-effort client-side classification, mirroring preprocessWorker.ts's isPdf/isImage — used only to enforce "one source type per import" and decide the deterministic merged-stack behavior; the server does its own real validation regardless. */
+function classifyFileKind(file: File): SourceKind {
+  const name = file.name.toLowerCase();
+  if (file.type === 'application/pdf' || name.endsWith('.pdf')) return 'pdf';
+  if (file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(name)) return 'image';
+  return 'doc';
+}
+
+const MAX_TITLE_LEN = 60;
+
+/**
+ * This import's own title — used for both imports.title and, for an
+ * image-source import, the shared stack's name (see createImport). Never
+ * the deck name: a deck can hold many imports, and every one of them
+ * getting the same deck-named stack was indistinguishable in the Stacks/
+ * Study browsers. Prompt mode uses the prompt itself (what the student
+ * actually asked for is the most meaningful label available); faithful
+ * mode uses the attached file name(s), since there's no prompt to draw from.
+ */
+function deriveImportTitle(files: File[], mode: ExtractionMode, prompt: string | undefined): string {
+  if (mode === 'prompt' && prompt) {
+    return prompt.length > MAX_TITLE_LEN ? `${prompt.slice(0, MAX_TITLE_LEN - 1)}…` : prompt;
+  }
+  const base = (files[0]?.name ?? 'Import').replace(/\.[^./]+$/, '');
+  return files.length > 1 ? `${base} +${files.length - 1} more` : base;
+}
+
+/**
+ * Deck-scoped "Import content" flow. The chooser is one ChatGPT-style
+ * composer — pick faithful or prompt-driven extraction, attach a source
+ * (image, PDF, or text/doc — an import may only contain one of these kinds,
+ * picked via the pills below the box), and either leave it at that
+ * (faithful, optionally with an answer key attached) or describe how the
+ * cards should be shaped (prompt mode, always wired — see
+ * preprocessWorker.ts's custom_prompt threading). A prompt with NO source
+ * attached also works — cards are generated entirely from the model's own
+ * knowledge, grounded by the prompt (see createPromptOnlyImport). YouTube
+ * and Anki import remain honest UI-only stubs until their backends exist.
  */
 export function renderImportContent(container: HTMLElement, deps: ImportContentDeps): void {
   const { deckId } = deps;
@@ -35,6 +91,15 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
   let busy = false;
   let startError: string | null = null;
   let forceImageOnly = false;
+
+  let extractionMode: ExtractionMode = 'faithful';
+  let promptText = '';
+  let attachedFiles: File[] = [];
+  // Faithful mode only — an optional answer key uploaded alongside the main
+  // source(s), never counted against the "one source type per import" lock.
+  let corrigeFile: File | null = null;
+  let showYoutubeInput = false;
+  let youtubeUrl = '';
 
   let cardsTab: CardsTab = 'paste';
   let cardsProgress: ImportProgress | null = null;
@@ -58,105 +123,275 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
   function renderBody(): void {
     const el = document.getElementById('importBody');
     if (!el) return;
-    if (mode === 'chooser') {
-      el.innerHTML = renderChooser();
-      wireChooser();
-      return;
-    }
     if (mode === 'cards') {
       el.innerHTML = renderCards();
       wireCards();
       return;
     }
-    el.innerHTML = renderTextbookStart();
-    wireTextbook();
+    if (mode === 'anki') {
+      el.innerHTML = renderAnki();
+      wireAnki();
+      return;
+    }
+    el.innerHTML = renderChooser();
+    wireChooser();
   }
 
-  // ---------- type chooser ----------
+  // ---------- chooser: mode split + composer + two file-import options ----------
+
+  /** The kind every currently-attached source file is locked to, or null when nothing's attached yet (any pill still selectable). */
+  function lockedKind(): SourceKind | null {
+    return attachedFiles.length ? classifyFileKind(attachedFiles[0]) : null;
+  }
+
+  function canSend(): boolean {
+    if (busy) return false;
+    if (youtubeUrl.trim()) return true;
+    if (extractionMode === 'faithful') return attachedFiles.length > 0;
+    // prompt mode: a prompt is required whenever anything's attached; a
+    // prompt with no source at all is the honest "coming soon" stub path,
+    // still sendable so the toast in handleComposerSend can explain that.
+    return promptText.trim().length > 0;
+  }
 
   function renderChooser(): string {
+    const locked = lockedKind();
+    const attachmentChips = attachedFiles.map((f, i) => `<span class="composer-chip">📎 ${esc(f.name)} <button type="button" data-remove-file="${i}" title="Remove">✕</button></span>`).join('');
+    const youtubeChip = !attachedFiles.length && youtubeUrl.trim() ? `<span class="composer-chip">▶️ ${esc(youtubeUrl.trim())} <button type="button" id="removeAttachmentBtn" title="Remove">✕</button></span>` : '';
+    const corrigeChip = corrigeFile ? `<span class="composer-chip">📋 ${esc(corrigeFile.name)} <button type="button" id="removeCorrigeBtn" title="Remove">✕</button></span>` : '';
+    const allChips = attachmentChips + youtubeChip + corrigeChip;
+
     return `
-      <div class="panelbox">
-        <h3>What are you importing?</h3>
-        <div class="import-type-choice">
+      ${
+        deps.isAdmin
+          ? `
+        <div class="composer-wrap">
+          ${startError ? `<div class="auth-err" style="margin-bottom:10px">${esc(startError)}</div>` : ''}
+
+          <div class="composer-mode-row">
+            <button type="button" class="composer-mode-btn ${extractionMode === 'faithful' ? 'on' : ''}" data-extraction-mode="faithful" ${busy ? 'disabled' : ''}>📚 Faithful extraction</button>
+            <button type="button" class="composer-mode-btn ${extractionMode === 'prompt' ? 'on' : ''}" data-extraction-mode="prompt" ${busy ? 'disabled' : ''}>✨ Generate with a prompt</button>
+          </div>
+
           ${
-            deps.isAdmin
-              ? `<button id="chooseTextbookBtn"><span class="t">📘 Textbook PDF</span><span class="d">Upload a textbook PDF (+ optional audio files) and extract each page faithfully for review.</span></button>`
+            extractionMode === 'prompt'
+              ? `<div class="composer-box">
+                   ${allChips ? `<div class="composer-attachments">${allChips}</div>` : ''}
+                   <textarea id="promptTextarea" class="composer-textarea" rows="2" placeholder="Describe the cards you want — e.g. &quot;make vocabulary flashcards from this&quot;." ${busy ? 'disabled' : ''}>${esc(promptText)}</textarea>
+                   <div class="composer-toolbar">
+                     <span class="composer-toolbar-hint">${attachedFiles.length && !promptText.trim() ? 'Add a prompt describing how to shape these cards' : ''}</span>
+                     <button type="button" class="composer-send-btn" id="composerSendBtn" ${canSend() ? '' : 'disabled'} title="Create">${busy ? '…' : '➤'}</button>
+                   </div>
+                 </div>
+                 <div class="composer-suggestion-pills">
+                   ${PROMPT_SUGGESTIONS.map((s) => `<button type="button" class="suggestion-pill" data-suggestion="${esc(s)}" ${busy ? 'disabled' : ''}>${esc(s)}</button>`).join('')}
+                 </div>`
+              : allChips
+                ? `<div class="composer-attachments composer-attachments-plain">${allChips}</div>`
+                : ''
+          }
+
+          <div class="composer-source-pills">
+            ${SOURCE_PILLS.map(
+              (p) =>
+                `<button type="button" class="source-pill" data-source-kind="${p.kind}" ${busy || (locked && locked !== p.kind) ? 'disabled' : ''} title="${locked && locked !== p.kind ? 'Remove attached files to switch source type' : `Attach ${p.label.toLowerCase()} — an import can only hold one source type`}">${p.icon} ${esc(p.label)}</button>`,
+            ).join('')}
+            <button type="button" class="source-pill source-pill-stub" id="youtubePillBtn" ${busy ? 'disabled' : ''} title="Coming soon">▶️ YouTube link</button>
+            ${
+              extractionMode === 'faithful'
+                ? `<button type="button" class="source-pill source-pill-optional" id="attachCorrigeBtn" ${busy ? 'disabled' : ''} title="Optional — gives exercises real, checkable answers instead of the usual read-only Verify placeholder">📋 Answer key <span class="opt">optional</span></button>`
+                : ''
+            }
+          </div>
+          <input type="file" id="sourceFileInput" multiple class="hide">
+          <input type="file" id="corrigeFileInput" accept="${CORRIGE_ACCEPT}" class="hide">
+          ${
+            showYoutubeInput
+              ? `<div class="youtube-input-row">
+                   <input type="text" id="youtubeUrlInput" placeholder="https://youtube.com/watch?v=…" value="${esc(youtubeUrl)}">
+                   <button type="button" class="btn-sec" id="attachYoutubeBtn">Attach</button>
+                 </div>`
               : ''
           }
-          <button id="chooseCardsBtn"><span class="t">🗂️ Cards / JSON</span><span class="d">Paste front⇥back lines, upload a JSON file, or add a card by hand.</span></button>
-        </div>
+
+          <label class="checkbox-field composer-advanced">
+            <input type="checkbox" id="forceImageOnlyCheckbox" ${forceImageOnly ? 'checked' : ''}>
+            Force image-only extraction (test mode)
+          </label>
+
+          ${
+            extractionMode === 'faithful'
+              ? `<button type="button" class="btn-primary composer-start-btn" id="composerSendBtn" ${canSend() ? '' : 'disabled'}>${busy ? 'Starting…' : 'Start faithful extraction →'}</button>`
+              : ''
+          }
+        </div>`
+          : ''
+      }
+
+      <div class="composer-below-options">
+        <button class="composer-option-btn" id="chooseJsonBtn"><span class="t">📄 Import from JSON</span></button>
+        <button class="composer-option-btn" id="chooseAnkiBtn"><span class="t">🗂️ Import from Anki package</span></button>
       </div>`;
   }
 
   function wireChooser(): void {
-    document.getElementById('chooseTextbookBtn')?.addEventListener('click', () => {
-      mode = 'textbook';
+    const textarea = document.getElementById('promptTextarea') as HTMLTextAreaElement | null;
+    const sendBtn = document.getElementById('composerSendBtn') as HTMLButtonElement | null;
+    const fileInput = document.getElementById('sourceFileInput') as HTMLInputElement | null;
+    const corrigeInput = document.getElementById('corrigeFileInput') as HTMLInputElement | null;
+
+    function refreshSendBtn(): void {
+      if (sendBtn) sendBtn.disabled = !canSend();
+    }
+
+    textarea?.addEventListener('input', () => {
+      promptText = textarea.value;
+      refreshSendBtn();
+    });
+
+    document.querySelectorAll<HTMLButtonElement>('[data-extraction-mode]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const next = btn.dataset.extractionMode as ExtractionMode;
+        if (next === extractionMode) return;
+        extractionMode = next;
+        // Each mode only uses its own extra field — drop the other so no
+        // stale hidden state rides along on send.
+        if (extractionMode === 'faithful') promptText = '';
+        else corrigeFile = null;
+        render();
+      });
+    });
+
+    document.querySelectorAll<HTMLButtonElement>('[data-suggestion]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const suggestion = btn.dataset.suggestion ?? '';
+        promptText = promptText.trim() ? `${promptText.trim()} — ${suggestion}` : suggestion;
+        render();
+      });
+    });
+
+    container.querySelectorAll<HTMLButtonElement>('[data-source-kind]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const pill = SOURCE_PILLS.find((p) => p.kind === btn.dataset.sourceKind);
+        if (!pill || !fileInput) return;
+        fileInput.accept = pill.accept;
+        fileInput.click();
+      });
+    });
+    fileInput?.addEventListener('change', () => {
+      const picked = fileInput.files ? Array.from(fileInput.files) : [];
+      fileInput.value = '';
+      if (!picked.length) return;
+      const targetKind = lockedKind() ?? classifyFileKind(picked[0]);
+      const matching = picked.filter((f) => classifyFileKind(f) === targetKind);
+      const rejected = picked.length - matching.length;
+      if (rejected > 0) toast(`Skipped ${rejected} file(s) that weren't ${targetKind} — an import can only contain one source type. Remove the attached files first to switch.`);
+      if (!matching.length) return;
+      attachedFiles = [...attachedFiles, ...matching];
+      youtubeUrl = '';
+      showYoutubeInput = false;
       render();
     });
-    document.getElementById('chooseCardsBtn')?.addEventListener('click', () => {
-      mode = 'cards';
+    container.querySelectorAll<HTMLButtonElement>('[data-remove-file]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.removeFile);
+        attachedFiles = attachedFiles.filter((_, idx) => idx !== i);
+        render();
+      });
+    });
+    document.getElementById('removeAttachmentBtn')?.addEventListener('click', () => {
+      youtubeUrl = '';
       render();
     });
-  }
-
-  // ---------- textbook flow: upload -> enqueue -> hand off ----------
-
-  function renderTextbookStart(): string {
-    return `
-      <div class="panelbox">
-        <h3>Upload textbook PDF</h3>
-        ${startError ? `<div class="auth-err">${esc(startError)}</div>` : ''}
-        ${IMPORT_SOURCES.map(
-          (s) => `
-          <div class="field">
-            <label>${esc(s.label)}${!s.required ? ' (optional)' : ''}</label>
-            <input type="file" id="file-${s.type}" accept="application/pdf,.pdf">
-          </div>`,
-        ).join('')}
-        <label class="checkbox-field">
-          <input type="checkbox" id="forceImageOnlyCheckbox" ${forceImageOnly ? 'checked' : ''}>
-          Force image-only extraction (test mode — skips the PDF text layer entirely, so every page is read straight off its image, same as a scanned page)
-        </label>
-        <button class="btn-primary" id="startTextbookBtn" ${busy ? 'disabled' : ''}>${busy ? 'Uploading…' : 'Start import'}</button>
-        <button class="btn-sec" id="backToChooserBtn" ${busy ? 'disabled' : ''}>← Choose a different type</button>
-      </div>`;
-  }
-
-  function wireTextbook(): void {
-    document.getElementById('startTextbookBtn')?.addEventListener('click', () => void startTextbookImport());
-    document.getElementById('backToChooserBtn')?.addEventListener('click', () => {
-      mode = 'chooser';
+    document.getElementById('youtubePillBtn')?.addEventListener('click', () => {
+      showYoutubeInput = !showYoutubeInput;
+      render();
+    });
+    document.getElementById('attachYoutubeBtn')?.addEventListener('click', () => {
+      const input = document.getElementById('youtubeUrlInput') as HTMLInputElement | null;
+      if (!input?.value.trim()) return;
+      youtubeUrl = input.value.trim();
+      attachedFiles = [];
+      showYoutubeInput = false;
+      render();
+    });
+    document.getElementById('attachCorrigeBtn')?.addEventListener('click', () => corrigeInput?.click());
+    corrigeInput?.addEventListener('change', () => {
+      const f = corrigeInput.files?.[0];
+      corrigeInput.value = '';
+      if (!f) return;
+      corrigeFile = f;
+      render();
+    });
+    document.getElementById('removeCorrigeBtn')?.addEventListener('click', () => {
+      corrigeFile = null;
       render();
     });
     document.getElementById('forceImageOnlyCheckbox')?.addEventListener('change', (e) => {
       forceImageOnly = (e.target as HTMLInputElement).checked;
     });
+    sendBtn?.addEventListener('click', () => void handleComposerSend());
+
+    document.getElementById('chooseJsonBtn')?.addEventListener('click', () => {
+      mode = 'cards';
+      render();
+    });
+    document.getElementById('chooseAnkiBtn')?.addEventListener('click', () => {
+      mode = 'anki';
+      render();
+    });
   }
 
-  async function startTextbookImport(): Promise<void> {
-    startError = null;
-    const selectedFiles: Partial<Record<ImportSourceType, File>> = {};
-    for (const s of IMPORT_SOURCES) {
-      const input = $<HTMLInputElement>(container, `#file-${s.type}`);
-      const file = input.files?.[0];
-      if (!file) {
-        if (s.required) {
-          startError = `Choose a file for "${s.label}".`;
-          render();
-          return;
-        }
-        continue;
-      }
-      selectedFiles[s.type] = file;
+  /**
+   * Source(s) + prompt (or sources alone) is real, wired to the actual
+   * pipeline — the prompt rides along as admin_instructions shaping every
+   * page's extraction (see preprocessWorker.ts). A prompt with no source at
+   * all is also real (see createPromptOnlyImport/startPromptOnlyImport) —
+   * cards generated entirely from the model's own knowledge, grounded by
+   * the prompt. Only YouTube and Anki import remain honest UI-only stubs.
+   */
+  async function handleComposerSend(): Promise<void> {
+    if (busy) return;
+    if (youtubeUrl.trim()) {
+      toast('YouTube import isn’t wired up yet — coming soon.');
+      return;
     }
+    if (!attachedFiles.length) {
+      if (extractionMode === 'prompt' && promptText.trim()) await startPromptOnlyImport(promptText.trim());
+      return;
+    }
+    const prompt = extractionMode === 'prompt' ? promptText.trim() : undefined;
+    if (extractionMode === 'prompt' && !prompt) return; // guarded by canSend()/disabled send button already
+    await startSourceImport(attachedFiles, prompt, extractionMode === 'faithful' ? corrigeFile : null);
+  }
 
+  /** No file at all — cards generated purely from the prompt (see createPromptOnlyImport). Skips file upload/preprocessing entirely; the import lands directly in the extraction stage. */
+  async function startPromptOnlyImport(prompt: string): Promise<void> {
+    startError = null;
+    busy = true;
+    render();
+    const title = deriveImportTitle([], 'prompt', prompt);
+    try {
+      const imp = await createPromptOnlyImport(deckId, title, prompt);
+      deps.onImportCreated(imp.id);
+    } catch (e) {
+      startError = 'Could not start import: ' + errMsg(e);
+      busy = false;
+      render();
+    }
+  }
+
+  async function startSourceImport(files: File[], customPrompt: string | undefined, corrige: File | null): Promise<void> {
+    startError = null;
     busy = true;
     render();
 
+    const isImageSource = classifyFileKind(files[0]) === 'image';
+    const title = deriveImportTitle(files, extractionMode, customPrompt);
+
     let importId: string;
     try {
-      const imp = await createImport(deckId, deps.deckName, forceImageOnly);
+      const imp = await createImport(deckId, title, forceImageOnly, customPrompt, isImageSource);
       importId = imp.id;
     } catch (e) {
       startError = 'Could not start import: ' + errMsg(e);
@@ -165,17 +400,31 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
       return;
     }
 
-    for (const s of IMPORT_SOURCES) {
-      const file = selectedFiles[s.type];
-      if (!file) continue;
+    const sourceType = IMPORT_SOURCES[0].type;
+    for (const file of files) {
       try {
-        const rec = await createImportFileRecord(importId, s.type, file);
+        const rec = await createImportFileRecord(importId, sourceType, file);
         await updateImportFileStatus(rec.id, 'uploading');
         await uploadImportSourceFile(rec.storage_path, file);
         await updateImportFileStatus(rec.id, 'completed');
       } catch (e) {
         const cls = await classifyImportError(e);
-        startError = `Could not upload ${s.label}: ${cls.message}`;
+        startError = `Could not upload "${file.name}": ${cls.message}`;
+        busy = false;
+        render();
+        return;
+      }
+    }
+
+    if (corrige) {
+      try {
+        const rec = await createImportFileRecord(importId, 'corrige', corrige);
+        await updateImportFileStatus(rec.id, 'uploading');
+        await uploadImportSourceFile(rec.storage_path, corrige);
+        await updateImportFileStatus(rec.id, 'completed');
+      } catch (e) {
+        const cls = await classifyImportError(e);
+        startError = `Could not upload the answer key "${corrige.name}": ${cls.message}`;
         busy = false;
         render();
         return;
@@ -196,11 +445,37 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
     deps.onImportCreated(importId);
   }
 
+  // ---------- Anki package import (UI only — not wired to a parser yet) ----------
+
+  function renderAnki(): string {
+    return `
+      <div class="panelbox">
+        <h3>Import from Anki package</h3>
+        <p style="font-size:13px;color:var(--ink-soft);margin-bottom:8px">Upload a <code>.apkg</code> file exported from Anki.</p>
+        <div class="filedrop" id="ankiDropZone">Click to choose a .apkg file</div>
+        <input type="file" id="ankiFile" accept=".apkg" class="hide">
+        <button class="btn-sec" id="backToChooserFromAnkiBtn" style="margin-top:10px">← Choose a different type</button>
+      </div>`;
+  }
+
+  function wireAnki(): void {
+    const fileInput = $<HTMLInputElement>(container, '#ankiFile');
+    document.getElementById('ankiDropZone')?.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files?.[0]) toast('Anki package import isn’t wired up yet — coming soon.');
+    });
+    document.getElementById('backToChooserFromAnkiBtn')?.addEventListener('click', () => {
+      mode = 'chooser';
+      render();
+    });
+  }
+
   // ---------- cards / json flow (unchanged — synchronous, no durability concerns) ----------
 
   function renderCards(): string {
     return `
       <div class="panelbox">
+        <button class="back-link" id="backToChooserFromCardsBtn" style="margin-bottom:10px">← Choose a different type</button>
         <h3>Add cards</h3>
         <div class="tabs">
           <button class="${cardsTab === 'paste' ? 'on' : ''}" data-tab="paste">Paste front⇥back</button>
@@ -213,6 +488,10 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
   }
 
   function wireCards(): void {
+    document.getElementById('backToChooserFromCardsBtn')?.addEventListener('click', () => {
+      mode = 'chooser';
+      render();
+    });
     document.querySelectorAll<HTMLElement>('.tabs button[data-tab]').forEach((btn) => {
       btn.addEventListener('click', () => {
         cardsTab = btn.dataset.tab as CardsTab;

@@ -5,19 +5,143 @@ import type { Import, ImportAudioFile, ImportFile, ImportFileStatus, ImportPage,
 const SOURCES_BUCKET = 'import-sources';
 const AUDIO_BUCKET = 'import-audio';
 
-/** The import flow's one required source: a paginated textbook PDF. Page-image review requires real pages, so non-PDF/plain-text sources aren't offered here. */
+/** The import flow's one required source: a PDF or image (paginated/single, shown alongside its cards), or a plain .txt file (real text, no page image). */
 export const IMPORT_SOURCES: { type: ImportSourceType; label: string; required: boolean }[] = [
-  { type: 'textbook', label: 'Textbook PDF', required: true },
+  { type: 'textbook', label: 'Source file', required: true },
 ];
 
-export async function createImport(deckId: string, title: string, forceImageOnly?: boolean): Promise<Import> {
+/**
+ * `customPrompt`, when set, is threaded into every page's extraction as
+ * admin_instructions (see preprocessWorker.ts's ensureExtractionJobsExist)
+ * — shapes the whole import's extraction, not per-page.
+ *
+ * `isImageSource` is deterministic, not a user choice (see SOURCE_PILLS /
+ * classifyFileKind in pages/import.ts: an import may only contain one source
+ * kind). When true — the source has no real page concept — this creates one
+ * shared 'custom' stack up front (named after this import's title) and
+ * records it as merged_stack_id, so every one of this import's generation
+ * units files its cards there instead of each getting its own stack (see
+ * extractWorker.ts). The per-unit stacks rows still get created either way
+ * and still track each unit's own extraction attempt independently;
+ * merged_stack_id only redirects where the resulting cards end up.
+ */
+export async function createImport(deckId: string, title: string, forceImageOnly?: boolean, customPrompt?: string, isImageSource?: boolean): Promise<Import> {
+  let mergedStackId: string | undefined;
+  if (isImageSource) {
+    const { data: mergedStack, error: mergedStackError } = await supabase
+      .from('stacks')
+      .insert({ deck_id: deckId, name: title, kind: 'custom', version: 1 })
+      .select('id')
+      .single();
+    if (mergedStackError) throw mergedStackError;
+    mergedStackId = mergedStack.id;
+  }
+
   const { data, error } = await supabase
     .from('imports')
-    .insert({ deck_id: deckId, title, ...(forceImageOnly ? { force_image_only: true } : {}) })
+    .insert({
+      deck_id: deckId,
+      title,
+      ...(forceImageOnly ? { force_image_only: true } : {}),
+      ...(customPrompt ? { custom_prompt: customPrompt } : {}),
+      ...(mergedStackId ? { merged_stack_id: mergedStackId } : {}),
+    })
     .select()
     .single();
   if (error) throw error;
   return data;
+}
+
+/**
+ * A prompt-mode import with no attached source at all — cards are generated
+ * purely from the admin's own knowledge, grounded by `prompt`, with nothing
+ * to extract from (see the PROMPT-ONLY exception in pageExtraction.ts and
+ * the isPromptOnly branch in extractWorker.ts). Reuses the same
+ * imports/import_pages/stacks/jobs pipeline every other import goes
+ * through — a real file just never enters the picture:
+ *
+ * - One shared 'custom' stack up front, same as an image-source import
+ *   (there's no real "page" concept to give each generation unit its own
+ *   stack).
+ * - A synthetic `import_files` row (no real upload, no real storage object)
+ *   exists purely because computeTextbookImportProgress (importProgress.ts)
+ *   keys its very first branch off "is there a textbook file at all" —
+ *   without one, the progress UI would show "Choose a source PDF to begin"
+ *   forever regardless of the real extraction state.
+ * - One synthetic `import_pages` row (text: null, no page image) that
+ *   extractWorker.ts recognizes as prompt-only precisely because it has
+ *   neither text nor a page image but admin_instructions is present.
+ * - The extract_page job is queued directly (skipping preprocess_import
+ *   entirely — there is nothing to preprocess).
+ */
+export async function createPromptOnlyImport(deckId: string, title: string, prompt: string): Promise<Import> {
+  const { data: mergedStack, error: mergedStackError } = await supabase
+    .from('stacks')
+    .insert({ deck_id: deckId, name: title, kind: 'custom', version: 1 })
+    .select('id')
+    .single();
+  if (mergedStackError) throw mergedStackError;
+
+  const { data: inserted, error: importError } = await supabase
+    .from('imports')
+    .insert({ deck_id: deckId, title, custom_prompt: prompt, merged_stack_id: mergedStack.id })
+    .select()
+    .single();
+  if (importError) throw importError;
+
+  // status/total_pages/pages_discovered/pages_prepared are worker-owned
+  // columns (see ImportInsert vs the Update type) — normally written by
+  // preprocessWorker.ts as it goes, but there's no preprocessing step here
+  // at all, so this jumps straight to "one page found and ready," matching
+  // what preprocessWorker.ts would have left behind for a one-page import.
+  const { data: imp, error: updateError } = await supabase
+    .from('imports')
+    .update({ status: 'extracting', total_pages: 1, pages_discovered: 1, pages_prepared: 1 })
+    .eq('id', inserted.id)
+    .select()
+    .single();
+  if (updateError) throw updateError;
+
+  const { error: fileError } = await supabase.from('import_files').insert({
+    import_id: imp.id,
+    source_type: 'textbook',
+    storage_path: '(none — prompt-only, no source file)',
+    filename: '(prompt only — no source file)',
+    status: 'completed',
+    size_bytes: 0,
+  });
+  if (fileError) throw fileError;
+
+  const { data: page, error: pageError } = await supabase
+    .from('import_pages')
+    .insert({
+      import_id: imp.id,
+      import_file_id: null,
+      source_type: 'textbook',
+      filename: '(prompt only)',
+      page_index: 0,
+      displayed_page_number: 1,
+      text: null,
+      extraction_status: 'extracted',
+      error: null,
+      image_regions: [],
+      page_pdf_path: null,
+      rendered_page_path: null,
+      width: null,
+      height: null,
+      visual_mime_type: 'application/pdf',
+    })
+    .select('id')
+    .single();
+  if (pageError) throw pageError;
+
+  await createJob({
+    type: 'extract_page',
+    deck_id: deckId,
+    payload: { import_id: imp.id, page_id: page.id, admin_instructions: prompt },
+  });
+
+  return imp;
 }
 
 export function importFilePath(importId: string, sourceType: ImportSourceType, filename: string): string {
@@ -104,6 +228,28 @@ export async function hasActivePreprocessJob(importId: string): Promise<boolean>
  */
 export async function resumePreprocessing(importId: string, deckId: string): Promise<void> {
   await enqueuePreprocessing(importId, deckId);
+}
+
+/**
+ * Permanently deletes an import and everything it produced — full cleanup,
+ * not a soft hide. `imports` cascades (via FK ON DELETE CASCADE) through
+ * `import_files` and `import_pages`, which in turn cascades to every
+ * kind='page' stack and its cards (source_page_id) — that chain is already
+ * enough for a pdf/doc import. An image-source import's shared merged
+ * stack has no source_page_id, so it sits outside that chain entirely and
+ * needs its own explicit delete first (which itself cascades to its
+ * cards via stack_id). Irreversible — callers must confirm with the user
+ * before calling this.
+ */
+export async function deleteImportCompletely(importId: string): Promise<void> {
+  const { data: imp, error: fetchError } = await supabase.from('imports').select('merged_stack_id').eq('id', importId).single();
+  if (fetchError) throw fetchError;
+  if (imp.merged_stack_id) {
+    const { error: stackError } = await supabase.from('stacks').delete().eq('id', imp.merged_stack_id);
+    if (stackError) throw stackError;
+  }
+  const { error: importError } = await supabase.from('imports').delete().eq('id', importId);
+  if (importError) throw importError;
 }
 
 /** The most recently-written failed page (for "Page 16 failed: <reason>" messaging) — null if none. */

@@ -60,6 +60,30 @@ function isPdf(file: ImportFileRow): boolean {
   return file.mime_type === 'application/pdf' || file.filename.toLowerCase().endsWith('.pdf');
 }
 
+/** A plain image source (no PDF at all) — generalizes the pipeline beyond textbook PDFs: treated as exactly one page, and the image itself IS that page's visual, no slicing/rasterization needed. */
+function isImage(file: ImportFileRow): boolean {
+  if (file.mime_type?.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|gif)$/i.test(file.filename);
+}
+
+function imageMimeType(file: ImportFileRow): string {
+  if (file.mime_type?.startsWith('image/')) return file.mime_type;
+  const ext = file.filename.toLowerCase().match(/\.(png|jpe?g|webp|gif)$/)?.[1] ?? 'png';
+  return `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+}
+
+/** A plain-text source — the file's own content IS the extraction input, no parsing needed at all. Treated as exactly one page, same as a single image, just with no page visual at all (Manage/Study already handle a missing source image gracefully). */
+function isTextFile(file: ImportFileRow): boolean {
+  if (file.mime_type === 'text/plain') return true;
+  return file.filename.toLowerCase().endsWith('.txt');
+}
+
+/** Not supported yet — deliberately rejected with a clear message rather than silently mis-parsed (a .docx is a zipped XML bundle, not plain text; reading it needs real parsing this pipeline doesn't have yet). */
+function isDocxFile(file: ImportFileRow): boolean {
+  if (file.mime_type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return true;
+  return /\.docx?$/i.test(file.filename);
+}
+
 function withTimeout<T>(promise: PromiseLike<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -227,14 +251,15 @@ async function sliceAndUploadPagePdf(
   supabase: SupabaseClient,
   pdfLibDoc: PDFDocument,
   importId: string,
-  pageIndex: number,
+  localPageIndex: number,
+  globalPageIndex: number,
 ): Promise<string | null> {
   try {
     const newDoc = await PDFDocument.create();
-    const [copiedPage] = await newDoc.copyPages(pdfLibDoc, [pageIndex]);
+    const [copiedPage] = await newDoc.copyPages(pdfLibDoc, [localPageIndex]);
     newDoc.addPage(copiedPage);
     const bytes = await newDoc.save();
-    const path = pagePdfStoragePath(importId, pageIndex);
+    const path = pagePdfStoragePath(importId, globalPageIndex);
     const { error } = await withTimeout(
       supabase.storage.from(PAGE_PDF_BUCKET).upload(path, bytes, { upsert: true, contentType: 'application/pdf' }),
       DOWNLOAD_TIMEOUT_MS,
@@ -264,13 +289,90 @@ async function upsertImportPage(
     image_regions: ImageRegion[];
     page_pdf_path: string | null;
   },
+  visualMimeType = 'application/pdf',
 ): Promise<void> {
   const query = supabase.from('import_pages').upsert(
-    { ...row, source_type: 'textbook', displayed_page_number: row.page_index + 1 },
+    { ...row, source_type: 'textbook', displayed_page_number: row.page_index + 1, visual_mime_type: visualMimeType },
     { onConflict: 'import_id,page_index' },
   );
   const { error } = await withTimeout(query as unknown as PromiseLike<{ error: unknown }>, DB_TIMEOUT_MS, 'import_pages upsert');
   if (error) throw error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * A plain-image source, generalized: no PDF at all, so there's nothing to
+ * split into pages or slice — the uploaded image itself IS the visual for
+ * whichever generation unit it is. Stored under the same page_pdf_path
+ * convention extractWorker.ts already reads from (bucket + naming
+ * unchanged), just with the real image mime type recorded so
+ * extractWorker.ts attaches it as an image, not a PDF. `pageIndex` is the
+ * GLOBAL position of this unit across every file in the import (see the
+ * generation-unit loop in processOnePreprocessJob) — it's what makes the
+ * storage path unique when several images are uploaded together, not just
+ * this file's own (always 0) position.
+ */
+async function processImageSourceImport(supabase: SupabaseClient, importId: string, file: ImportFileRow, pageIndex: number): Promise<{ error?: string }> {
+  const { data: blob, error: downloadError } = await withTimeout(
+    supabase.storage.from(BUCKET).download(file.storage_path),
+    DOWNLOAD_TIMEOUT_MS,
+    `image source download (${file.filename})`,
+  );
+  if (downloadError || !blob) return { error: `could not download "${file.filename}": ${downloadError?.message ?? 'unknown'}` };
+
+  const mimeType = imageMimeType(file);
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const path = pagePdfStoragePath(importId, pageIndex);
+  const { error: uploadError } = await withTimeout(
+    supabase.storage.from(PAGE_PDF_BUCKET).upload(path, bytes, { upsert: true, contentType: mimeType }),
+    DOWNLOAD_TIMEOUT_MS,
+    'image visual upload',
+  );
+  if (uploadError) return { error: `could not store "${file.filename}" as this page's visual` };
+
+  await upsertImportPage(
+    supabase,
+    {
+      import_id: importId,
+      import_file_id: file.id,
+      filename: file.filename,
+      page_index: pageIndex,
+      text: null,
+      extraction_status: 'image_only',
+      error: null,
+      image_regions: [],
+      page_pdf_path: path,
+    },
+    mimeType,
+  );
+
+  return {};
+}
+
+/** A plain-text source: the raw file content becomes this unit's text directly — no download-and-slice step, no visual attachment at all (page_pdf_path stays null, same as any page with no usable image). `pageIndex` is this unit's global position across every file in the import, same as the image case above. */
+async function processTextSourceImport(supabase: SupabaseClient, importId: string, file: ImportFileRow, pageIndex: number): Promise<{ error?: string }> {
+  const { data: blob, error: downloadError } = await withTimeout(
+    supabase.storage.from(BUCKET).download(file.storage_path),
+    DOWNLOAD_TIMEOUT_MS,
+    `text source download (${file.filename})`,
+  );
+  if (downloadError || !blob) return { error: `could not download "${file.filename}": ${downloadError?.message ?? 'unknown'}` };
+
+  const text = await blob.text();
+  if (!text.trim()) return { error: `"${file.filename}" is empty` };
+
+  await upsertImportPage(supabase, {
+    import_id: importId,
+    import_file_id: file.id,
+    filename: file.filename,
+    page_index: pageIndex,
+    text,
+    extraction_status: 'extracted',
+    error: null,
+    image_regions: [],
+    page_pdf_path: null,
+  });
+
+  return {};
 }
 
 /** Recomputes pages_discovered/prepared/failed straight from import_pages — always exact, never drifts from incremental counters across retried/resumed batches. */
@@ -330,8 +432,28 @@ export async function requeueStalePreprocessJobs(supabase: SupabaseClient): Prom
   return data?.length ?? 0;
 }
 
-/** Ensures every currently-'extracted' page has an extract_page job — per-page idempotent (never re-creates one that already exists), so a page fixed by a later retry still gets queued for extraction even if the import already moved past preprocessing once before. */
-async function ensureExtractionJobsExist(supabase: SupabaseClient, importId: string, deckId: string, userId: string): Promise<void> {
+/**
+ * Ensures every currently-'extracted' page has an extract_page job —
+ * per-page idempotent (never re-creates one that already exists), so a page
+ * fixed by a later retry still gets queued for extraction even if the
+ * import already moved past preprocessing once before. `customPrompt`, when
+ * set, rides along on every job's payload as admin_instructions — the same
+ * field extractWorker.ts already applies for "re-extract with
+ * instructions," just supplied up front here instead of after the fact.
+ * `answerKey`, when set (faithful-mode imports with an attached corrigé),
+ * rides along the same way as `answer_key_storage_path`/
+ * `answer_key_mime_type` — extractWorker.ts downloads and attaches it to
+ * every page's Gemini call. It's not a generation unit itself (see
+ * processOnePreprocessJob), just a reference document shared by every page.
+ */
+async function ensureExtractionJobsExist(
+  supabase: SupabaseClient,
+  importId: string,
+  deckId: string,
+  userId: string,
+  customPrompt: string | null,
+  answerKey: { storagePath: string; mimeType: string } | null,
+): Promise<void> {
   const { data: preparedPages, error: pagesError } = await supabase
     .from('import_pages')
     .select('id')
@@ -353,7 +475,12 @@ async function ensureExtractionJobsExist(supabase: SupabaseClient, importId: str
     type: 'extract_page',
     user_id: userId,
     deck_id: deckId,
-    payload: { import_id: importId, page_id: p.id },
+    payload: {
+      import_id: importId,
+      page_id: p.id,
+      admin_instructions: customPrompt,
+      ...(answerKey ? { answer_key_storage_path: answerKey.storagePath, answer_key_mime_type: answerKey.mimeType } : {}),
+    },
   }));
   await supabase.from('jobs').insert(rows);
 }
@@ -369,7 +496,7 @@ export async function processOnePreprocessJob(supabase: SupabaseClient): Promise
 
   const { data: importRow, error: importError } = await supabase
     .from('imports')
-    .select('id, deck_id, user_id, total_pages, pages_discovered, force_image_only')
+    .select('id, deck_id, user_id, total_pages, pages_discovered, force_image_only, custom_prompt')
     .eq('id', importId)
     .single();
   if (importError || !importRow) {
@@ -384,85 +511,135 @@ export async function processOnePreprocessJob(supabase: SupabaseClient): Promise
       .from('import_files')
       .select('id, storage_path, filename, mime_type')
       .eq('import_id', importId)
-      .eq('source_type', 'textbook');
+      .eq('source_type', 'textbook')
+      .order('created_at', { ascending: true });
     if (filesError) throw new Error('could not load import_files');
+    const sourceFiles = (files ?? []) as ImportFileRow[];
+    if (!sourceFiles.length) throw new Error('textbook_required');
 
-    const textbookFile = (files ?? [])[0] as ImportFileRow | undefined;
-    if (!textbookFile) throw new Error('textbook_required');
-    if (!isPdf(textbookFile)) throw new Error('textbook_must_be_pdf');
+    // Faithful-mode-only, optional — not a generation unit, never split into
+    // pages, just a reference document threaded into every page's job below.
+    const { data: corrigeFiles } = await supabase
+      .from('import_files')
+      .select('storage_path, filename, mime_type')
+      .eq('import_id', importId)
+      .eq('source_type', 'corrige')
+      .order('created_at', { ascending: true })
+      .limit(1);
+    const corrigeFile = (corrigeFiles?.[0] ?? null) as Pick<ImportFileRow, 'storage_path' | 'filename' | 'mime_type'> | null;
+    const answerKey = corrigeFile
+      ? {
+          storagePath: corrigeFile.storage_path,
+          mimeType: corrigeFile.mime_type ?? (corrigeFile.filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/png'),
+        }
+      : null;
 
-    const { data: blob, error: downloadError } = await withTimeout(
-      supabase.storage.from(BUCKET).download(textbookFile.storage_path),
-      DOWNLOAD_TIMEOUT_MS,
-      'textbook download',
-    );
-    if (downloadError || !blob) throw new Error(`could not download textbook file: ${downloadError?.message ?? 'unknown'}`);
-
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    const pdf = await withTimeout(getDocumentProxy(bytes), DB_TIMEOUT_MS, 'open PDF');
-    // Loaded once per batch (not per page) and reused for every page's
-    // slice below — best-effort: a source PDF pdf.js tolerates but pdf-lib
-    // can't parse just means no page slices this batch, never a failure.
-    const pdfLibDoc = await PDFDocument.load(bytes, { ignoreEncryption: true }).catch(() => null);
-
-    const totalPages = pdf.numPages;
-    if (importRow.total_pages !== totalPages) {
-      await touchImportProgress(supabase, importId, { total_pages: totalPages });
+    for (const f of sourceFiles) {
+      if (isDocxFile(f)) throw new Error(`"${f.filename}" is a Word document (.docx) — not supported yet. Upload a .txt file, PDF, or image instead.`);
+      if (!isPdf(f) && !isImage(f) && !isTextFile(f)) throw new Error(`"${f.filename}" is an unsupported file type — upload a PDF, image, or .txt file.`);
     }
 
-    // Retry mode reprocesses only the specific pages named in the job
+    // Every source file contributes one or more "generation units" — a PDF
+    // contributes one unit per page, an image or text file contributes
+    // exactly one. page_index (and every per-unit storage path) is this
+    // unit's GLOBAL position across every file in the import, not a
+    // per-file position — the exact same resumable cursor concept the
+    // single-PDF pipeline always used, just now spanning however many files
+    // were uploaded together instead of assuming there's only one.
+    const pdfCache = new Map<string, { pdf: Awaited<ReturnType<typeof getDocumentProxy>>; pdfLibDoc: PDFDocument | null }>();
+    const units: { file: ImportFileRow; kind: 'pdf' | 'image' | 'text'; localIndex: number }[] = [];
+    for (const f of sourceFiles) {
+      if (isPdf(f)) {
+        const { data: blob, error: downloadError } = await withTimeout(
+          supabase.storage.from(BUCKET).download(f.storage_path),
+          DOWNLOAD_TIMEOUT_MS,
+          `download "${f.filename}"`,
+        );
+        if (downloadError || !blob) throw new Error(`could not download "${f.filename}": ${downloadError?.message ?? 'unknown'}`);
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const pdf = await withTimeout(getDocumentProxy(bytes), DB_TIMEOUT_MS, `open "${f.filename}"`);
+        // Best-effort: a source PDF pdf.js tolerates but pdf-lib can't parse
+        // just means no page slices for this file, never a failure.
+        const pdfLibDoc = await PDFDocument.load(bytes, { ignoreEncryption: true }).catch(() => null);
+        pdfCache.set(f.id, { pdf, pdfLibDoc });
+        for (let i = 0; i < pdf.numPages; i++) units.push({ file: f, kind: 'pdf', localIndex: i });
+      } else if (isImage(f)) {
+        units.push({ file: f, kind: 'image', localIndex: 0 });
+      } else {
+        units.push({ file: f, kind: 'text', localIndex: 0 });
+      }
+    }
+
+    const totalUnits = units.length;
+    if (importRow.total_pages !== totalUnits) {
+      await touchImportProgress(supabase, importId, { total_pages: totalUnits });
+    }
+
+    // Retry mode reprocesses only the specific units named in the job
     // payload (used by "Retry failed pages"); normal mode resumes
     // sequentially from the persisted cursor (pages_discovered) so already-
-    // written pages are never re-parsed.
-    const targetIndices = retryIndices?.length ? retryIndices : Array.from({ length: totalPages - (importRow.pages_discovered ?? 0) }, (_, i) => (importRow.pages_discovered ?? 0) + i);
+    // written units are never re-parsed.
+    const targetIndices = retryIndices?.length ? retryIndices : Array.from({ length: totalUnits - (importRow.pages_discovered ?? 0) }, (_, i) => (importRow.pages_discovered ?? 0) + i);
 
     const batchStart = Date.now();
     let processedInBatch = 0;
-    for (const i of targetIndices) {
-      if (Date.now() - batchStart > BATCH_TIME_BUDGET_MS) break; // bounded — remaining pages picked up by the next invocation
+    for (const globalIndex of targetIndices) {
+      if (Date.now() - batchStart > BATCH_TIME_BUDGET_MS) break; // bounded — remaining units picked up by the next invocation
 
-      await touchImportProgress(supabase, importId, { current_page_index: i });
+      const unit = units[globalIndex];
+      if (!unit) continue; // defensive — should never happen once totalUnits is correct
+
+      await touchImportProgress(supabase, importId, { current_page_index: globalIndex });
 
       try {
-        const { text, imageRegions } = await extractOnePageText(pdf, i);
-        // force_image_only is an admin test toggle (see the imports column
-        // comment) that deliberately ignores any embedded text layer found —
-        // it routes every page through the same image-only path a scanned
-        // page would take, to A/B-test extraction quality between the two.
-        const hasText = !importRow.force_image_only && !!text.trim();
-        // A page-PDF slice is attempted regardless of whether the text layer
-        // came back empty — it's the only way a scanned/image-only page (no
-        // embedded text objects at all) can still reach extraction, via the
-        // model reading the page image directly instead of numbered lines.
-        const pagePdfPath = pdfLibDoc ? await sliceAndUploadPagePdf(supabase, pdfLibDoc, importId, i) : null;
-        const status: ExtractionStatus = hasText ? 'extracted' : pagePdfPath ? 'image_only' : 'unreadable';
-        await upsertImportPage(supabase, {
-          import_id: importId,
-          import_file_id: textbookFile.id,
-          filename: textbookFile.filename,
-          page_index: i,
-          text: hasText ? text : null,
-          extraction_status: status,
-          error: status === 'unreadable' ? 'no embedded text layer and no page image could be produced' : null,
-          image_regions: imageRegions,
-          page_pdf_path: pagePdfPath,
-        });
+        if (unit.kind === 'pdf') {
+          const cached = pdfCache.get(unit.file.id)!;
+          const { text, imageRegions } = await extractOnePageText(cached.pdf, unit.localIndex);
+          // force_image_only is an admin test toggle (see the imports column
+          // comment) that deliberately ignores any embedded text layer found —
+          // it routes every page through the same image-only path a scanned
+          // page would take, to A/B-test extraction quality between the two.
+          const hasText = !importRow.force_image_only && !!text.trim();
+          // A page-PDF slice is attempted regardless of whether the text layer
+          // came back empty — it's the only way a scanned/image-only page (no
+          // embedded text objects at all) can still reach extraction, via the
+          // model reading the page image directly instead of numbered lines.
+          const pagePdfPath = cached.pdfLibDoc ? await sliceAndUploadPagePdf(supabase, cached.pdfLibDoc, importId, unit.localIndex, globalIndex) : null;
+          const status: ExtractionStatus = hasText ? 'extracted' : pagePdfPath ? 'image_only' : 'unreadable';
+          await upsertImportPage(supabase, {
+            import_id: importId,
+            import_file_id: unit.file.id,
+            filename: unit.file.filename,
+            page_index: globalIndex,
+            text: hasText ? text : null,
+            extraction_status: status,
+            error: status === 'unreadable' ? 'no embedded text layer and no page image could be produced' : null,
+            image_regions: imageRegions,
+            page_pdf_path: pagePdfPath,
+          });
+        } else if (unit.kind === 'image') {
+          const result = await processImageSourceImport(supabase, importId, unit.file, globalIndex);
+          if (result.error) throw new Error(result.error);
+        } else {
+          const result = await processTextSourceImport(supabase, importId, unit.file, globalIndex);
+          if (result.error) throw new Error(result.error);
+        }
       } catch (pageError) {
-        // One page's failure is recorded on that page alone and never
-        // aborts the batch — page i+1 is attempted next regardless.
+        // One unit's failure is recorded on that unit alone and never
+        // aborts the batch — the next unit is attempted regardless.
         const message = pageError instanceof Error ? pageError.message : String(pageError);
         await upsertImportPage(supabase, {
           import_id: importId,
-          import_file_id: textbookFile.id,
-          filename: textbookFile.filename,
-          page_index: i,
+          import_file_id: unit.file.id,
+          filename: unit.file.filename,
+          page_index: globalIndex,
           text: null,
           extraction_status: 'unreadable',
           error: message,
           image_regions: [],
           page_pdf_path: null,
         }).catch(() => {
-          /* if even recording the failure fails, the page just stays absent — next batch/retry will attempt it again */
+          /* if even recording the failure fails, the unit just stays absent — next batch/retry will attempt it again */
         });
       }
 
@@ -490,13 +667,13 @@ export async function processOnePreprocessJob(supabase: SupabaseClient): Promise
     }
 
     const counts = await recomputeAndPersistCounts(supabase, importId);
-    const sequentialComplete = counts.discovered >= totalPages;
+    const sequentialComplete = counts.discovered >= totalUnits;
 
     if (sequentialComplete) {
       if (counts.prepared === 0) {
-        await touchImportProgress(supabase, importId, { status: 'failed', preprocessing_error: 'No page could be processed — the file may be corrupted, password-protected, or not a valid PDF.' });
+        await touchImportProgress(supabase, importId, { status: 'failed', preprocessing_error: 'No page could be processed — check that your file(s) are valid and not corrupted or password-protected.' });
       } else {
-        await ensureExtractionJobsExist(supabase, importId, importRow.deck_id, importRow.user_id);
+        await ensureExtractionJobsExist(supabase, importId, importRow.deck_id, importRow.user_id, importRow.custom_prompt, answerKey);
         // Never regress a later-stage status (extracting/needs_review/
         // completed/completed_with_errors) — this branch only advances a
         // page that just got fixed by a targeted retry after everything
@@ -507,14 +684,14 @@ export async function processOnePreprocessJob(supabase: SupabaseClient): Promise
         }
       }
     } else if (isRetryBatch) {
-      // Retry batch finished its specific pages, but sequential discovery
+      // Retry batch finished its specific units, but sequential discovery
       // was never the concern here — leave overall status untouched.
       await touchImportProgress(supabase, importId, { current_page_index: null });
     }
 
     await supabase.rpc('complete_job', {
       p_job_id: job.id,
-      p_result: { total_pages: totalPages, pages_prepared: counts.prepared, pages_failed: counts.failed, pages_discovered: counts.discovered },
+      p_result: { total_pages: totalUnits, pages_prepared: counts.prepared, pages_failed: counts.failed, pages_discovered: counts.discovered },
     });
 
     return { claimed: true, jobId: job.id, batchComplete: true };

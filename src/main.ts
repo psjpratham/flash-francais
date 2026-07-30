@@ -1,7 +1,8 @@
 import './style.css';
 import type { Session } from '@supabase/supabase-js';
 import { getMyRole, getSession, onAuthChange, signOut } from './lib/auth';
-import { loadQueueForDeck } from './lib/cards';
+import { loadQueueAcrossAllDecks, loadQueueForDeck } from './lib/cards';
+import { listDecksWithCounts } from './lib/decks';
 import { renderAuth } from './pages/auth';
 import { renderLibrary } from './pages/library';
 import { renderDeckDetail } from './pages/deck';
@@ -9,9 +10,12 @@ import { renderSession } from './pages/session';
 import { renderPageReview } from './pages/pageReview';
 import { renderImportContent } from './pages/import';
 import { renderImportDetail } from './pages/importDetail';
+import { renderStacksList } from './pages/stacksList';
+import { renderStudyPicker } from './pages/studyPicker';
+import { renderStudyMode } from './pages/studyMode';
 import { initAccentKeyboard } from './lib/accentKeyboard';
 import { $, errMsg, esc, toast } from './lib/dom';
-import type { CardWithNote, DeckWithCounts } from './types';
+import type { CardWithNote, Deck, DeckWithCounts } from './types';
 
 const app = $(document, '#app');
 const topRight = $(document, '#topRight');
@@ -21,11 +25,18 @@ initAccentKeyboard();
 type View =
   | { name: 'library' }
   | { name: 'deck'; deckId: string }
-  | { name: 'session'; deck: DeckWithCounts; queue: CardWithNote[] }
-  | { name: 'page-review'; deckId: string; deckName: string; importId: string | null }
+  /** `decks` carries every deck a card in `queue` might belong to — one entry for a normal per-deck session, several for global "practice everything due". */
+  | { name: 'session'; decks: Map<string, Deck>; queue: CardWithNote[] }
+  | { name: 'page-review'; deckId: string; deckName: string; importId: string | null; initialPageId?: string }
   | { name: 'import'; deckId: string; deckName: string }
   /** The durable, permanent home for one import — always a real import_id, never "the latest". */
-  | { name: 'import-detail'; deckId: string; deckName: string; importId: string };
+  | { name: 'import-detail'; deckId: string; deckName: string; importId: string }
+  /** Manage-content: browse/edit this deck's stacks. Nothing about studying lives here — see 'study-picker'. */
+  | { name: 'stacks-list'; deckId: string; deckName: string }
+  /** Study's own front door — pick which stack(s), optionally narrowed by tag, before handing off to 'study-mode'. */
+  | { name: 'study-picker'; deckId: string; deckName: string }
+  /** Study mode: no scheduling, just a sequential walk through whichever stack(s) were selected on the Study picker — optionally narrowed by tag. */
+  | { name: 'study-mode'; deckId: string; deckName: string; stackIds: string[]; tagFilter: string[] };
 let view: View = { name: 'library' };
 let wasAuthenticated = false;
 let disposeSession: (() => void) | null = null;
@@ -46,17 +57,33 @@ function renderHeader(session: Session | null, due?: number, streak?: number): v
   $(topRight, '#signOutBtn').addEventListener('click', () => void signOut());
 }
 
-async function startSession(session: Session, deck: DeckWithCounts, tagFilter: string[]): Promise<void> {
+async function startSession(session: Session, deck: DeckWithCounts): Promise<void> {
   try {
-    const queue = await loadQueueForDeck(deck, tagFilter);
+    const queue = await loadQueueForDeck(deck);
     if (!queue.length) {
-      toast(tagFilter.length ? 'No cards match that tag filter' : 'Nothing due right now');
+      toast('Nothing due right now');
       return;
     }
-    view = { name: 'session', deck, queue };
+    view = { name: 'session', decks: new Map([[deck.id, deck]]), queue };
     renderView(session);
   } catch (e) {
     toast('Could not start session: ' + errMsg(e));
+  }
+}
+
+/** Global practice: every deck's due+new pool combined into one session — the zero-configuration, cross-deck counterpart to startSession. */
+async function startGlobalSession(session: Session): Promise<void> {
+  try {
+    const decks = await listDecksWithCounts();
+    const queue = await loadQueueAcrossAllDecks(decks);
+    if (!queue.length) {
+      toast('Nothing due right now');
+      return;
+    }
+    view = { name: 'session', decks: new Map(decks.map((d) => [d.id, d])), queue };
+    renderView(session);
+  } catch (e) {
+    toast('Could not start practice: ' + errMsg(e));
   }
 }
 
@@ -71,7 +98,7 @@ function renderView(session: Session): void {
         view = { name: 'deck', deckId };
         renderView(session);
       },
-      onStudyAll: () => toast('Study session — coming soon'),
+      onStudyAll: () => void startGlobalSession(session),
       onStatsLoaded: (totalDue, streakCurrent) => renderHeader(session, totalDue, streakCurrent),
     });
     return;
@@ -83,9 +110,9 @@ function renderView(session: Session): void {
         view = { name: 'library' };
         renderView(session);
       },
-      onStartSession: (deck, tagFilter) => void startSession(session, deck, tagFilter),
-      onOpenImport: (id, name, importId) => {
-        view = { name: 'import-detail', deckId: id, deckName: name, importId };
+      onStartSession: (deck) => void startSession(session, deck),
+      onOpenStudyPicker: (id, name) => {
+        view = { name: 'study-picker', deckId: id, deckName: name };
         renderView(session);
       },
       currentUserId: session.user.id,
@@ -97,14 +124,68 @@ function renderView(session: Session): void {
         view = { name: 'import', deckId: id, deckName: name };
         renderView(session);
       },
+      onOpenStacks: (id, name) => {
+        view = { name: 'stacks-list', deckId: id, deckName: name };
+        renderView(session);
+      },
+    });
+    return;
+  }
+  if (view.name === 'stacks-list') {
+    const { deckId, deckName } = view;
+    void renderStacksList(app, {
+      deckId,
+      deckName,
+      onBack: () => {
+        view = { name: 'deck', deckId };
+        renderView(session);
+      },
+      onOpenPageStack: (importId, pageId) => {
+        view = { name: 'page-review', deckId, deckName, importId, initialPageId: pageId };
+        renderView(session);
+      },
+      onOpenImportDetail: (id, name, importId) => {
+        view = { name: 'import-detail', deckId: id, deckName: name, importId };
+        renderView(session);
+      },
+    });
+    return;
+  }
+  if (view.name === 'study-picker') {
+    const { deckId, deckName } = view;
+    void renderStudyPicker(app, {
+      deckId,
+      deckName,
+      onBack: () => {
+        view = { name: 'deck', deckId };
+        renderView(session);
+      },
+      onStudySelected: (stackIds, tagFilter) => {
+        view = { name: 'study-mode', deckId, deckName, stackIds, tagFilter };
+        renderView(session);
+      },
+    });
+    return;
+  }
+  if (view.name === 'study-mode') {
+    const { deckId, deckName, stackIds, tagFilter } = view;
+    void renderStudyMode(app, {
+      stackIds,
+      tagFilter,
+      onBack: () => {
+        view = { name: 'study-picker', deckId, deckName };
+        renderView(session);
+      },
     });
     return;
   }
   if (view.name === 'session') {
-    const deckId = view.deck.id;
-    disposeSession = renderSession(app, view.deck, view.queue, {
+    const { decks } = view;
+    // A single-deck session returns to that deck; a global (multi-deck) one has no single deck to go back to, so it returns to the library instead.
+    const singleDeckId = decks.size === 1 ? [...decks.keys()][0] : null;
+    disposeSession = renderSession(app, decks, view.queue, {
       onEnd: () => {
-        view = { name: 'deck', deckId };
+        view = singleDeckId ? { name: 'deck', deckId: singleDeckId } : { name: 'library' };
         renderView(session);
       },
       onSeeAllStats: () => {
@@ -115,13 +196,14 @@ function renderView(session: Session): void {
     return;
   }
   if (view.name === 'page-review') {
-    const { deckId, deckName, importId } = view;
+    const { deckId, deckName, importId, initialPageId } = view;
     void renderPageReview(app, {
       deckId,
       deckName,
       importId,
+      initialPageId,
       onBack: () => {
-        view = { name: 'deck', deckId };
+        view = { name: 'stacks-list', deckId, deckName };
         renderView(session);
       },
     });
@@ -135,7 +217,7 @@ function renderView(session: Session): void {
       importId,
       isAdmin,
       onBack: () => {
-        view = { name: 'deck', deckId };
+        view = { name: 'stacks-list', deckId, deckName };
         renderView(session);
       },
       onOpenPageReview: (id) => {

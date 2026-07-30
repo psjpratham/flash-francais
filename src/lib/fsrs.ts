@@ -89,9 +89,16 @@ export function scheduleCard(card: Card, grade: Rating, retention: number, now?:
   }
 
   if (card.state === 'learning' || card.state === 'relearning') {
+    // A card only ever leaves 'new' via the branch above, which always sets
+    // difficulty/stability — null here would mean a corrupt row, not a
+    // legitimate state, so a non-null assertion (not a fallback default) is
+    // the right way to satisfy the wider (nullable, to allow a fresh
+    // imported card) Card type.
+    const difficulty = card.difficulty!;
+    const stability = card.stability!;
     const steps = card.state === 'learning' ? LEARN_STEPS_MIN : RELEARN_STEPS_MIN;
-    out.difficulty = card.difficulty;
-    out.stability = card.stability;
+    out.difficulty = difficulty;
+    out.stability = stability;
     if (grade === 1) {
       out.state = card.state;
       out.step = 0;
@@ -108,17 +115,19 @@ export function scheduleCard(card: Card, grade: Rating, retention: number, now?:
         out.due = new Date(now + steps[nextStep] * 60000).toISOString();
       } else {
         out.state = 'review';
-        out.due = new Date(now + intervalDaysForRetention(retention, card.stability) * 86400000).toISOString();
+        out.due = new Date(now + intervalDaysForRetention(retention, stability) * 86400000).toISOString();
       }
     }
     return out;
   }
 
   // state === 'review'
-  const R = retrievability(elapsedDays, card.stability);
-  const Dp = nextDifficulty(card.difficulty, grade);
+  const difficulty = card.difficulty!;
+  const stability = card.stability!;
+  const R = retrievability(elapsedDays, stability);
+  const Dp = nextDifficulty(difficulty, grade);
   if (grade === 1) {
-    const Sf = nextStabilityForget(card.difficulty, card.stability, R);
+    const Sf = nextStabilityForget(difficulty, stability, R);
     out.state = 'relearning';
     out.step = 0;
     out.due = new Date(now + RELEARN_STEPS_MIN[0] * 60000).toISOString();
@@ -126,7 +135,7 @@ export function scheduleCard(card: Card, grade: Rating, retention: number, now?:
     out.difficulty = Dp;
     out.lapses = card.lapses + 1;
   } else {
-    const Sr = nextStabilityRecall(card.difficulty, card.stability, R, grade);
+    const Sr = nextStabilityRecall(difficulty, stability, R, grade);
     out.state = 'review';
     out.due = new Date(now + intervalDaysForRetention(retention, Sr) * 86400000).toISOString();
     out.stability = Sr;

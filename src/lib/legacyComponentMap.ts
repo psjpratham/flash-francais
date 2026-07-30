@@ -47,13 +47,16 @@ const LEGACY_INTERACTION_MAP: Record<string, string> = {
   listening: 'listening',
 };
 
-const NEW_DOCUMENT_RECIPES = new Set(['text', 'vocabulary', 'grammar_rule', 'table', 'dialogue']);
+const NEW_DOCUMENT_RECIPES = new Set(['text', 'vocabulary', 'flashcard', 'grammar_rule', 'table', 'dialogue']);
 const NEW_INTERACTION_RECIPES = new Set([
   'single_choice',
   'multi_select',
   'text_input',
   'matching_pairs',
   'ordering',
+  // 'categorize' was missing here — a real categorize block fell through to
+  // the 'text_input' fallback below instead of rendering its sorting UI.
+  'categorize',
   'speaking',
   'listening',
   'dialogue',

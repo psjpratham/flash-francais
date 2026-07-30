@@ -141,9 +141,10 @@ const INTERACTION_RENDERERS: Record<string, (b: PageBlock) => string> = {
 
 /** Renders one block's content only (no edit chrome) — callers wrap this with review controls. */
 export function renderBlockContent(block: PageBlock): string {
-  if (block.kind === 'image_ref') return imageRefBlock(block);
-  if (block.kind === 'audio_ref') return audioRefBlock(block);
-  const renderer = block.kind === 'interaction' ? INTERACTION_RENDERERS[block.component_type] : DOCUMENT_RENDERERS[block.component_type];
+  if (block.block_kind === 'image_ref') return imageRefBlock(block);
+  if (block.block_kind === 'audio_ref') return audioRefBlock(block);
+  const componentType = block.component_type ?? '';
+  const renderer = block.block_kind === 'interaction' ? INTERACTION_RENDERERS[componentType] : DOCUMENT_RENDERERS[componentType];
   return renderer ? renderer(block) : textBlock(block);
 }
 

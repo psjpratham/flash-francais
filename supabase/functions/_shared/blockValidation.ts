@@ -41,6 +41,8 @@ export interface ValidatedBlock {
   tags: string[];
   needs_review: boolean;
   review_reason: string | null;
+  /** 'available' when this block's answer field(s) in `content` were populated from an attached answer key, 'unavailable' when a key was attached but didn't cover this item, null/unset when no key was attached at all (today's default — see readModeRenderers.ts's Verify area). Invalid/unrecognized values fall back to null. */
+  answer_key_status: 'available' | 'unavailable' | 'unknown' | null;
 }
 
 export interface ValidatedPage {
@@ -87,7 +89,7 @@ function normalizeTags(v: unknown): string[] {
 // A small, generic set of card recipes — not a taxonomy of textbook
 // phrasings. 'dialogue' is valid under both document (plain reading) and
 // interaction (fill-in-the-blank turns) kinds.
-const DOCUMENT_RECIPES = new Set(['text', 'vocabulary', 'grammar_rule', 'table', 'dialogue']);
+const DOCUMENT_RECIPES = new Set(['text', 'vocabulary', 'flashcard', 'grammar_rule', 'table', 'dialogue']);
 const INTERACTION_RECIPES = new Set(['single_choice', 'multi_select', 'text_input', 'matching_pairs', 'ordering', 'categorize', 'speaking', 'listening', 'dialogue', 'freeform']);
 const CATEGORIES = new Set(['vocabulary', 'grammar', 'culture', 'reading', 'exercise', 'audio', 'writing']);
 const COMPOSED_TYPES = new Set<string>(COMPOSED_PRIMITIVE_TYPES);
@@ -154,8 +156,11 @@ function toRawText(raw: Record<string, unknown>, reason: string): ValidatedBlock
     tags: normalizeTags(raw.tags),
     needs_review: true,
     review_reason: reason,
+    answer_key_status: null,
   };
 }
+
+const ANSWER_KEY_STATUSES = new Set(['available', 'unavailable', 'unknown']);
 
 export function validateBlock(raw: unknown, path: string): ValidationResult<ValidatedBlock> {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: `${path}: block is not an object` };
@@ -223,6 +228,7 @@ export function validateBlock(raw: unknown, path: string): ValidationResult<Vali
       tags: normalizeTags(b.tags),
       needs_review: modelNeedsReview,
       review_reason: modelReviewReason,
+      answer_key_status: typeof b.answer_key_status === 'string' && ANSWER_KEY_STATUSES.has(b.answer_key_status) ? (b.answer_key_status as 'available' | 'unavailable' | 'unknown') : null,
     },
   };
 }

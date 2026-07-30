@@ -23,12 +23,43 @@ function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   });
 }
 
+function isPdfSource(filename: string, mimeType: string | null): boolean {
+  return mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf');
+}
+
+/** A plain-text source has no visual at all to render — Manage/Study already show "source image not available" gracefully when rendered_page_path stays null forever, same as it would for a failed render. */
+function isTextSource(filename: string, mimeType: string | null): boolean {
+  return mimeType === 'text/plain' || filename.toLowerCase().endsWith('.txt');
+}
+
+/** Natural pixel size of an already-decoded image blob — used for a plain-image source, which needs no rasterization, just its own dimensions recorded. */
+function imageDimensions(blob: Blob): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('could not decode image'));
+    };
+    img.src = url;
+  });
+}
+
 /**
  * Renders every usable page (extracted text or image-only) that has no
  * rendered_page_path yet, uploading each as a PNG to the private
  * import-page-renders bucket and recording the result on its import_pages
  * row. Idempotent — already-rendered pages are skipped, so calling this
  * again only fills in gaps.
+ *
+ * A PDF source is rasterized page-by-page via pdf.js (unchanged). A plain-
+ * image source (see visual_mime_type/processImageSourceImport server-side)
+ * has nothing to rasterize — its one page's "rendered image" is just the
+ * original upload, copied across buckets as-is.
  */
 export async function renderPendingPageImages(importId: string): Promise<{ rendered: number }> {
   const [pages, files] = await Promise.all([listImportPages(importId), listImportFiles(importId)]);
@@ -37,9 +68,26 @@ export async function renderPendingPageImages(importId: string): Promise<{ rende
 
   const pending = pages.filter((p) => (p.extraction_status === 'extracted' || p.extraction_status === 'image_only') && !p.rendered_page_path);
   if (!pending.length) return { rendered: 0 };
+  if (isTextSource(textbookFile.filename, textbookFile.mime_type)) return { rendered: 0 };
 
   const { data: blob, error: downloadError } = await supabase.storage.from('import-sources').download(textbookFile.storage_path);
   if (downloadError || !blob) throw downloadError ?? new Error('could not download textbook file for rendering');
+
+  if (!isPdfSource(textbookFile.filename, textbookFile.mime_type)) {
+    let rendered = 0;
+    for (const page of pending) {
+      const { width, height } = await imageDimensions(blob);
+      const storagePath = `${importId}/${page.id}.png`;
+      const { error: uploadError } = await supabase.storage.from(RENDER_BUCKET).upload(storagePath, blob, {
+        upsert: true,
+        contentType: blob.type || 'image/png',
+      });
+      if (uploadError) throw uploadError;
+      await updateImportPageRender(page.id, { rendered_page_path: storagePath, width, height });
+      rendered++;
+    }
+    return { rendered };
+  }
 
   const pdf = await pdfjsLib.getDocument({ data: await blob.arrayBuffer() }).promise;
 

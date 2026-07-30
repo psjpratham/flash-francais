@@ -32,6 +32,7 @@ const MAX_CHARS_PER_REQUEST = 6000;
 const MAX_REPAIR_ATTEMPTS = 2;
 const JOB_TIME_BUDGET_MS = 150_000;
 const PAGE_PDF_BUCKET = 'import-page-pdfs';
+const SOURCES_BUCKET = 'import-sources';
 const PAGE_PDF_DOWNLOAD_TIMEOUT_MS = 15_000;
 
 /** Downloads and base64-encodes this page's single-page PDF slice — null (never a thrown error) when there isn't one, so extraction always falls back to text-only rather than failing the job over a missing/broken attachment. */
@@ -40,6 +41,20 @@ async function loadPagePdfBase64(supabase: SupabaseClient, pagePdfPath: string |
   try {
     const download = supabase.storage.from(PAGE_PDF_BUCKET).download(pagePdfPath);
     const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('page pdf download timed out')), PAGE_PDF_DOWNLOAD_TIMEOUT_MS));
+    const { data: blob, error } = await Promise.race([download, timeout]);
+    if (error || !blob) return null;
+    return encodeBase64(new Uint8Array(await blob.arrayBuffer()));
+  } catch {
+    return null;
+  }
+}
+
+/** Downloads and base64-encodes the import's optional answer key (corrigé), shared by every page in the import — null (never a thrown error) when there isn't one or the download fails, so a missing/broken answer key just means no card gets an answer this run, never a failed job. */
+async function loadAnswerKeyBase64(supabase: SupabaseClient, storagePath: string | null): Promise<string | null> {
+  if (!storagePath) return null;
+  try {
+    const download = supabase.storage.from(SOURCES_BUCKET).download(storagePath);
+    const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('answer key download timed out')), PAGE_PDF_DOWNLOAD_TIMEOUT_MS));
     const { data: blob, error } = await Promise.race([download, timeout]);
     if (error || !blob) return null;
     return encodeBase64(new Uint8Array(await blob.arrayBuffer()));
@@ -94,11 +109,17 @@ async function runOneExtractionCall(
   adminInstructions?: string | null,
   imageOnly?: boolean,
   existingTags?: string[],
+  visualMimeType = 'application/pdf',
+  answerKey?: { mimeType: string; base64: string } | null,
+  promptOnly?: boolean,
 ): Promise<ExtractionCallResult> {
+  const inlineData = [pagePdfBase64 ? { mimeType: visualMimeType, base64: pagePdfBase64 } : null, answerKey ? { mimeType: answerKey.mimeType, base64: answerKey.base64 } : null].filter(
+    (d): d is { mimeType: string; base64: string } => d !== null,
+  );
   const baseCallParams = {
     systemPrompt: SYSTEM_PROMPT,
-    userPrompt: buildUserPrompt({ pageNumber: 0, numberedSourceLines: numberedLines, imageRegions, adminInstructions, imageOnly, existingTags }),
-    inlineData: pagePdfBase64 ? [{ mimeType: 'application/pdf', base64: pagePdfBase64 }] : undefined,
+    userPrompt: buildUserPrompt({ pageNumber: 0, numberedSourceLines: numberedLines, imageRegions, adminInstructions, imageOnly, promptOnly, existingTags, hasAnswerKey: !!answerKey }),
+    inlineData: inlineData.length ? inlineData : undefined,
   };
 
   let latencyMs = 0;
@@ -155,6 +176,9 @@ async function runFullExtraction(
   adminInstructions?: string | null,
   imageOnly?: boolean,
   existingTags?: string[],
+  visualMimeType = 'application/pdf',
+  answerKey?: { mimeType: string; base64: string } | null,
+  promptOnly?: boolean,
 ): Promise<{
   ok: boolean;
   blocks: ValidatedBlock[];
@@ -166,10 +190,11 @@ async function runFullExtraction(
   model: string;
   error?: string;
 }> {
-  // An image-only page has zero source lines, so splitIntoLineChunks would
-  // otherwise produce zero chunks and skip extraction entirely — force one
-  // (empty) chunk so the model still gets called with just the page image.
-  const chunks = sourceLines.length ? splitIntoLineChunks(sourceLines) : imageOnly ? [[]] : [];
+  // An image-only or prompt-only page has zero source lines, so
+  // splitIntoLineChunks would otherwise produce zero chunks and skip
+  // extraction entirely — force one (empty) chunk so the model still gets
+  // called (with the page image, or with nothing but admin_instructions).
+  const chunks = sourceLines.length ? splitIntoLineChunks(sourceLines) : imageOnly || promptOnly ? [[]] : [];
   let orderCursor = 0;
   const allBlocks: ValidatedBlock[] = [];
   const allWarnings: PageWarningOut[] = [];
@@ -184,7 +209,17 @@ async function runFullExtraction(
     // page — on the single/first chunk — rather than re-uploaded with every
     // chunked call for an unusually text-dense page.
     const isFirstChunk = chunks.length === 1 || chunks.indexOf(chunk) === 0;
-    const result = await runOneExtractionCall(formatNumberedLines(chunk), isFirstChunk ? imageRegions : [], isFirstChunk ? pagePdfBase64 : null, adminInstructions, imageOnly, existingTags);
+    const result = await runOneExtractionCall(
+      formatNumberedLines(chunk),
+      isFirstChunk ? imageRegions : [],
+      isFirstChunk ? pagePdfBase64 : null,
+      adminInstructions,
+      imageOnly,
+      existingTags,
+      visualMimeType,
+      isFirstChunk ? answerKey : null,
+      promptOnly,
+    );
     totalLatencyMs += result.latencyMs ?? 0;
     if (result.model) model = result.model;
     if (!detectedLanguage && result.detectedLanguage) detectedLanguage = result.detectedLanguage;
@@ -262,11 +297,28 @@ async function maybeFinalizeImport(supabase: SupabaseClient, importId: string): 
     .limit(1);
   if (activeJobs && activeJobs.length > 0) return; // still work left — not this call's job to finalize
 
-  const { data: failedJobs } = await supabase.from('jobs').select('id').eq('type', 'extract_page').eq('payload->>import_id', importId).eq('status', 'failed').limit(1);
-  const { data: completedJobs } = await supabase.from('jobs').select('id').eq('type', 'extract_page').eq('payload->>import_id', importId).eq('status', 'completed').limit(1);
+  // A retried page's extraction is a brand-new job row, never an update of
+  // the old one — the old terminal row is kept as attempt history. Only the
+  // most recent job per page reflects that page's current outcome; without
+  // this dedup, an old 'failed' row from before a successful retry would
+  // pin the import at completed_with_errors forever.
+  const { data: allJobs } = await supabase
+    .from('jobs')
+    .select('status, payload, created_at')
+    .eq('type', 'extract_page')
+    .eq('payload->>import_id', importId);
 
-  const anyFailed = (failedJobs?.length ?? 0) > 0;
-  const anyCompleted = (completedJobs?.length ?? 0) > 0;
+  const latestByPage = new Map<string, { status: string; created_at: string }>();
+  for (const row of (allJobs ?? []) as { status: string; payload: { page_id: string }; created_at: string }[]) {
+    const pageId = row.payload.page_id;
+    const current = latestByPage.get(pageId);
+    if (!current || new Date(row.created_at).getTime() > new Date(current.created_at).getTime()) {
+      latestByPage.set(pageId, { status: row.status, created_at: row.created_at });
+    }
+  }
+
+  const anyFailed = [...latestByPage.values()].some((j) => j.status === 'failed');
+  const anyCompleted = [...latestByPage.values()].some((j) => j.status === 'completed');
 
   const status = !anyCompleted ? 'failed' : anyFailed ? 'completed_with_errors' : 'needs_review';
   await supabase
@@ -286,15 +338,18 @@ export interface ExtractResult {
   error?: string;
 }
 
-type ExtractJobRow = { id: string; payload: { import_id: string; page_id: string; admin_instructions?: string | null } };
+type ExtractJobRow = {
+  id: string;
+  payload: { import_id: string; page_id: string; admin_instructions?: string | null; answer_key_storage_path?: string | null; answer_key_mime_type?: string | null };
+};
 
 /** Processes one already-claimed extract_page job end to end (extraction, audit/repair, block insert, finalize). Pulled out of processOneExtractionJob so a batch of claimed jobs can each be handed to this and run concurrently — see processExtractionJobsBatch. */
 async function processClaimedExtractionJob(supabase: SupabaseClient, job: ExtractJobRow): Promise<ExtractResult> {
-  const { import_id: importId, page_id: pageId, admin_instructions: adminInstructions } = job.payload;
+  const { import_id: importId, page_id: pageId, admin_instructions: adminInstructions, answer_key_storage_path: answerKeyStoragePath, answer_key_mime_type: answerKeyMimeType } = job.payload;
 
   const { data: page, error: pageError } = await supabase
     .from('import_pages')
-    .select('id, text, extraction_status, image_regions, page_pdf_path')
+    .select('id, text, extraction_status, image_regions, page_pdf_path, visual_mime_type, displayed_page_number, page_index')
     .eq('id', pageId)
     .single();
   if (pageError || !page) {
@@ -308,22 +363,47 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   // (see the imageOnly branch below and pageExtraction.ts's IMAGE-ONLY
   // PAGES exception).
   const isImageOnly = page.extraction_status === 'image_only' && !!page.page_pdf_path;
-  if (!isTextExtracted && !isImageOnly) {
+  // No text AND no page image AND admin_instructions present — a prompt-
+  // only import (see createPromptOnlyImport in src/lib/imports.ts): there
+  // is no source at all, only a request describing what to generate. Never
+  // true when adminInstructions is absent — that combination has genuinely
+  // nothing to work from and must still fail below, same as always.
+  const isPromptOnly = !page.text && !page.page_pdf_path && !!adminInstructions;
+  if (!isTextExtracted && !isImageOnly && !isPromptOnly) {
     await supabase.rpc('fail_job', { p_job_id: job.id, p_error: 'page has no extracted text or page image to work from' });
     await maybeFinalizeImport(supabase, importId);
     return { claimed: true, jobId: job.id, error: 'page_has_no_text' };
   }
 
-  const { data: existingVersions } = await supabase.from('page_extractions').select('version').eq('page_id', pageId).order('version', { ascending: false }).limit(1);
+  // stacks (formerly page_extractions) needs deck_id/name up front now —
+  // both previously reachable only lazily via RLS joins, now required
+  // NOT NULL columns on insert. merged_stack_id, when set, is where this
+  // page's CARDS actually get filed (see the cards.insert below) — the
+  // per-page stacks row below is still always created and still always
+  // tracks this one page's own extraction attempt/status/warnings/version,
+  // completely unaffected by merge. That's what makes unmerge trivial later:
+  // the original per-page stack never goes away, merge only redirects where
+  // the resulting cards live.
+  const { data: importRow, error: importRowError } = await supabase.from('imports').select('deck_id, merged_stack_id').eq('id', importId).single();
+  if (importRowError || !importRow) {
+    await supabase.rpc('fail_job', { p_job_id: job.id, p_error: 'could not resolve deck for import' });
+    await maybeFinalizeImport(supabase, importId);
+    return { claimed: true, jobId: job.id, error: 'import_missing' };
+  }
+  const deckId = importRow.deck_id as string;
+  const mergedStackId = importRow.merged_stack_id as string | null;
+  const stackName = `Page ${page.displayed_page_number ?? page.page_index + 1}`;
+
+  const { data: existingVersions } = await supabase.from('stacks').select('version').eq('source_page_id', pageId).order('version', { ascending: false }).limit(1);
   const nextVersion = ((existingVersions?.[0]?.version as number | undefined) ?? 0) + 1;
 
   const { data: extractionRow, error: insertError } = await supabase
-    .from('page_extractions')
-    .insert({ page_id: pageId, version: nextVersion, status: 'processing', model: getConfiguredGeminiModel(), prompt_version: PROMPT_VERSION })
+    .from('stacks')
+    .insert({ source_page_id: pageId, deck_id: deckId, name: stackName, kind: 'page', version: nextVersion, status: 'processing', model: getConfiguredGeminiModel(), prompt_version: PROMPT_VERSION })
     .select()
     .single();
   if (insertError || !extractionRow) {
-    await supabase.rpc('fail_job', { p_job_id: job.id, p_error: 'could not create page_extractions row' });
+    await supabase.rpc('fail_job', { p_job_id: job.id, p_error: 'could not create stacks row' });
     await maybeFinalizeImport(supabase, importId);
     return { claimed: true, jobId: job.id, error: 'write_failed' };
   }
@@ -334,6 +414,16 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   // PDF, or the upload failed during preprocessing) still gets a text-only
   // extraction rather than failing the job — see sliceAndUploadPagePdf.
   const pagePdfBase64 = await loadPagePdfBase64(supabase, page.page_pdf_path as string | null);
+  // 'application/pdf' for every page produced by the textbook-PDF pipeline;
+  // a real image mime (e.g. 'image/png') for a plain-image source instead —
+  // see visual_mime_type/processImageSourceImport in preprocessWorker.ts.
+  const visualMimeType = (page.visual_mime_type as string | null) ?? 'application/pdf';
+  // Faithful-mode-only, optional — shared by every page in this import (see
+  // preprocessWorker.ts's ensureExtractionJobsExist); best-effort, same as
+  // the page's own PDF slice — a failed download just means no card gets an
+  // answer this run, never a failed job.
+  const answerKeyBase64 = await loadAnswerKeyBase64(supabase, answerKeyStoragePath ?? null);
+  const answerKey = answerKeyBase64 ? { mimeType: answerKeyMimeType ?? 'application/pdf', base64: answerKeyBase64 } : null;
   // Fetched fresh per job so every page sees whatever tags earlier pages
   // (including ones from other imports/units) have already contributed —
   // see TAGS in pageExtraction.ts.
@@ -341,9 +431,9 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   const existingTags = (tagRows ?? []).map((r) => r.name as string);
   const jobStarted = Date.now();
 
-  const attempt = await runFullExtraction(sourceLines, imageRegions, pagePdfBase64, adminInstructions, isImageOnly, existingTags);
+  const attempt = await runFullExtraction(sourceLines, imageRegions, pagePdfBase64, adminInstructions, isImageOnly, existingTags, visualMimeType, answerKey, isPromptOnly);
   if (!attempt.ok) {
-    await supabase.from('page_extractions').update({ status: 'failed', raw_model_response: { attempts: attempt.raw }, updated_at: new Date().toISOString() }).eq('id', extractionRow.id);
+    await supabase.from('stacks').update({ status: 'failed', raw_model_response: { attempts: attempt.raw }, updated_at: new Date().toISOString() }).eq('id', extractionRow.id);
     await supabase.rpc('fail_job', { p_job_id: job.id, p_error: attempt.error ?? 'extraction failed' });
     await maybeFinalizeImport(supabase, importId);
     return { claimed: true, jobId: job.id, error: attempt.error };
@@ -363,7 +453,11 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   // than the job running indefinitely.
   const withinJobBudget = () => Date.now() - jobStarted < JOB_TIME_BUDGET_MS;
 
-  const pdfInlineData = pagePdfBase64 ? [{ mimeType: 'application/pdf', base64: pagePdfBase64 }] : undefined;
+  const pdfInlineData = pagePdfBase64 ? [{ mimeType: visualMimeType, base64: pagePdfBase64 }] : undefined;
+  // The repair stage (unlike audit/polish) is where answer fields actually
+  // get written/fixed, so it's the one other stage that needs the answer
+  // key attached alongside the page's own slice.
+  const repairInlineData = [...(pdfInlineData ?? []), ...(answerKey ? [{ mimeType: answerKey.mimeType, base64: answerKey.base64 }] : [])];
 
   for (let repairAttempt = 1; repairAttempt <= MAX_REPAIR_ATTEMPTS && needsAudit() && withinJobBudget(); repairAttempt++) {
     const auditOutcome = await callGemini({
@@ -372,6 +466,7 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
         numberedSourceLines: formatNumberedLines(sourceLines),
         imageRegions,
         pageExtractionJson: { blocks, page_warnings: modelWarnings },
+        hasAdminInstructions: !!adminInstructions,
       }),
       inlineData: pdfInlineData,
     });
@@ -404,8 +499,9 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
         currentExtractionJson: { blocks, page_warnings: modelWarnings },
         auditJson: auditResult,
         adminInstructions,
+        hasAnswerKey: !!answerKey,
       }),
-      inlineData: pdfInlineData,
+      inlineData: repairInlineData.length ? repairInlineData : undefined,
     });
     if (!repairOutcome.ok) break;
     const parsedRepair = parseJsonContent(repairOutcome.content);
@@ -451,7 +547,19 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
     }
   }
 
-  const unresolvedWarnings = [...coverageToWarnings(coverage), ...modelWarnings.map((w) => ({ code: w.code, message: w.message, source_line_ids: w.source_line_ids }))];
+  // Deterministic line-coverage gaps are only a real fidelity problem in the
+  // default, unshaped-extraction case. Once an admin prompt is steering
+  // extraction, "every source line must appear on a card" stops being a
+  // valid correctness signal — the admin may have deliberately asked to
+  // skip content — so those gaps are dropped from unresolved_warnings
+  // entirely rather than surfaced as a caution badge for something that's
+  // working exactly as instructed. The repair pass above still sees them
+  // (and already receives adminInstructions itself, so it can reason about
+  // whether a gap is intentional) — only the final surfaced warnings change.
+  const unresolvedWarnings = [
+    ...(adminInstructions ? [] : coverageToWarnings(coverage)),
+    ...modelWarnings.map((w) => ({ code: w.code, message: w.message, source_line_ids: w.source_line_ids })),
+  ];
 
   // Purely-visual fields derived deterministically rather than asked of the
   // model: this pass still never captures answer keys or wires real audio
@@ -460,12 +568,23 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   // for French document/interaction text.
   const isFrench = (attempt.detectedLanguage ?? '').toLowerCase().startsWith('fr');
 
-  const { error: blocksInsertError } = await supabase.from('page_blocks').insert(
+  // When merged, every page in the import files its cards under the same
+  // shared stack — order_index alone would then collide across pages (each
+  // page's own blocks start back at 0), so it's offset by this page's
+  // global position to keep merged cards in the right overall order. Not
+  // needed (and not applied) for the ordinary unmerged case, where a stack
+  // only ever holds one page's blocks to begin with.
+  const cardStackId = mergedStackId ?? extractionRow.id;
+  const orderOffset = mergedStackId ? page.page_index * 1000 : 0;
+
+  const { error: blocksInsertError } = await supabase.from('cards').insert(
     blocks.map((b) => ({
-      page_extraction_id: extractionRow.id,
-      page_id: pageId,
-      order_index: b.order_index,
-      kind: b.kind,
+      stack_id: cardStackId,
+      source_page_id: pageId,
+      deck_id: deckId,
+      origin: 'textbook_extraction',
+      order_index: orderOffset + b.order_index,
+      block_kind: b.kind,
       component_type: b.component_type,
       section_number: b.section_number,
       title: b.title,
@@ -480,10 +599,13 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
       tags: b.tags,
       needs_review: b.needs_review,
       review_reason: b.review_reason,
+      answer_key_status: b.answer_key_status,
+      prompt_generated: !!adminInstructions,
+      include_in_practice: false,
     })),
   );
   if (blocksInsertError) {
-    await supabase.from('page_extractions').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', extractionRow.id);
+    await supabase.from('stacks').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', extractionRow.id);
     await supabase.rpc('fail_job', { p_job_id: job.id, p_error: 'could not store extracted blocks' });
     await maybeFinalizeImport(supabase, importId);
     return { claimed: true, jobId: job.id, error: 'write_failed' };
@@ -503,7 +625,7 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   }
 
   await supabase
-    .from('page_extractions')
+    .from('stacks')
     .update({
       status: 'needs_review',
       model: attempt.model,

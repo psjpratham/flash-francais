@@ -95,7 +95,7 @@ export async function computeTextbookImportProgress(importId: string): Promise<T
       failedUnits: 0,
       percent: 0,
       indeterminate: false,
-      message: 'Choose a textbook PDF to begin.',
+      message: 'Choose a source PDF to begin.',
       sourceFiles,
     };
   }
@@ -111,7 +111,7 @@ export async function computeTextbookImportProgress(importId: string): Promise<T
         failedUnits: 1,
         percent: 0,
         indeterminate: false,
-        message: 'The textbook file failed to upload.',
+        message: 'The source file failed to upload.',
         errorDetail: textbookFile.error ?? undefined,
         sourceFiles,
       };
@@ -124,7 +124,7 @@ export async function computeTextbookImportProgress(importId: string): Promise<T
       failedUnits: 0,
       percent: textbookFile.status === 'uploading' ? 5 : 0,
       indeterminate: false,
-      message: 'Uploading the textbook file…',
+      message: 'Uploading the source file…',
       sourceFiles,
     };
   }
@@ -148,7 +148,7 @@ export async function computeTextbookImportProgress(importId: string): Promise<T
   if (imp.status === 'needs_review' || imp.status === 'completed' || imp.status === 'completed_with_errors') {
     const reviewCounts = await getPageReviewCounts(importId);
     const jobs = await getExtractionProgress(importId);
-    const label = imp.status === 'completed' ? 'Completed — every page reviewed and approved.' : imp.status === 'completed_with_errors' ? `Completed with errors — ${jobs.failed} page(s) failed and can be retried.` : `Ready for page review — ${reviewCounts.needsReview} page(s) need review, ${reviewCounts.approved} approved.`;
+    const label = imp.status === 'completed_with_errors' ? `Completed with errors — ${jobs.failed} page(s) failed and can be retried.` : `Extraction complete — ${jobs.completed} page(s) ready in Stacks.`;
     return {
       status: imp.status === 'completed' ? 'completed' : imp.status === 'completed_with_errors' ? 'completed_with_errors' : 'completed',
       currentStage: STAGE.READY,

@@ -122,68 +122,22 @@ export type NoteFields = {
   [key: string]: unknown;
 };
 
-export type Note = {
-  id: string;
-  deck_id: string;
-  note_type: NoteType;
-  tags: string[];
-  fields: NoteFields;
-  review_status: ReviewStatus;
-  confidence: Confidence;
-  review_reasons: string[];
-  source_evidence: SourceEvidence | null;
-  extraction_diagnostics: ExtractionDiagnostics | null;
-  /** Set when this note was compiled from an imported page_block (see sendPageBlocksToPractice) — null for manually/paste/JSON-authored notes. Session rendering uses this to show the same split page-image view as the review UI, reusing the referenced block live rather than a snapshot. */
-  source_block_id: string | null;
-  created_at: string;
-};
-
-export type NoteInsert = Pick<Note, 'deck_id'> &
-  Partial<
-    Pick<
-      Note,
-      'note_type' | 'tags' | 'review_status' | 'confidence' | 'review_reasons' | 'source_evidence' | 'extraction_diagnostics' | 'source_block_id'
-    >
-  > &
-  Pick<Note, 'fields'>;
-
 // ---------- cards ----------
+// A unified table (see migration 20260728000000): one row is both the
+// reviewable, per-recipe imported content AND the FSRS-scheduled
+// practiceable card — no more separate notes+cards copy. `Card` is an
+// alias of `PageBlock` (defined further below, in the card-recipe section,
+// where its richer content-type doc comments already live) — kept as two
+// names rather than one full rename so existing call sites reading either
+// name keep working.
 
-export type Card = {
-  id: string;
-  note_id: string;
-  deck_id: string;
-  state: CardState;
-  due: string;
-  difficulty: number;
-  stability: number;
-  reps: number;
-  lapses: number;
-  step: number;
-  last_review: string | null;
-  created_at: string;
-};
+export type Card = PageBlock;
+export type CardInsert = PageBlockInsert;
+export type CardUpdate = PageBlockUpdate;
 
-export type CardInsert = Pick<Card, 'note_id' | 'deck_id'> &
-  Partial<Omit<Card, 'id' | 'note_id' | 'deck_id' | 'created_at'>>;
-
-export type CardUpdate = Partial<
-  Pick<
-    Card,
-    'state' | 'due' | 'difficulty' | 'stability' | 'reps' | 'lapses' | 'step' | 'last_review'
-  >
->;
-
-/** The imported block a practice note was compiled from, joined in live at queue-load time (see loadQueueForDeck's NOTES_SELECT) — the full row (renderReadModeBlock needs it whole) plus its page's rendered image path, reused for the session's split view. Null for a manually-authored note. */
-export type SourceBlockForSession = PageBlock & {
-  import_pages: { rendered_page_path: string | null } | null;
-};
-
-/** A card joined with its parent note, as returned by the study-queue query. */
+/** A card joined with its source page's rendered image path — replaces the old two-hop CardWithNote/SourceBlockForSession split now that a card carries its own textbook-origin fields directly. `import_pages` is null for a manual/custom-stack card (no source page) or when the page's image hasn't been rendered yet. */
 export type CardWithNote = Card & {
-  notes: Pick<Note, 'fields' | 'note_type' | 'tags' | 'source_block_id'> & {
-    page_blocks: SourceBlockForSession | null;
-  };
+  import_pages: { rendered_page_path: string | null } | null;
 };
 
 // ---------- review_log ----------
@@ -231,6 +185,7 @@ export type LegacyCardComponentType =
 export type CardRecipe =
   | 'text' // reading content: headings, passages, instructions, notes, examples — rich text, with an optional adjunct table
   | 'vocabulary' // a themed group of term/translation/example entries, purpose-built (not a generic table)
+  | 'flashcard' // a single recall card with a real front/back (+ optional detail) — only ever prompt-generated, never faithful-extracted; see CardFlashcardContent
   | 'grammar_rule' // a rule statement + examples, purpose-built (not a generic paragraph)
   | 'table' // real tabular/grid data only
   | 'dialogue' // speaker turns, optionally with inline blanks to fill in
@@ -305,17 +260,36 @@ export type CardTextContent = { nodes?: RichTextNode[]; text?: string; table?: s
 export type CardTableContent = { headers?: string[]; rows?: string[][]; pairs?: { term: string; translation?: string }[] };
 /** 'vocabulary' recipe: a themed group of terms — purpose-built layout (term prominent, pronunciation, translation, optional example), not a flat table. */
 export type CardVocabularyContent = { title?: string | null; pairs: { term: string; translation?: string | null; example?: string | null }[] };
+/** An example sentence with its English translation — new cards always produce this shape; a pre-v13 card may still have a plain string in its place (see renderFlashcardDetailHTML's defensive handling), never migrated in place. */
+export type CardFlashcardExample = { fr: string; en: string };
+/** Supplementary detail shown on a flashcard's back, behind chips — same fields the manual-card chip system (profiles.ts) already renders, just sourced from here instead of `fields` for a textbook_extraction-origin flashcard. */
+export type CardFlashcardDetail = {
+  ipa?: string | null;
+  examples?: (CardFlashcardExample | string)[] | null;
+  wiktionary?: string | null;
+  rule?: string | null;
+  table?: string[][] | null;
+  register?: string | null;
+  note?: string | null;
+  tip?: string | null;
+};
+/** 'flashcard' recipe: a single real recall card — front/back are authored (not verbatim source_text) whenever this recipe is used, which is only ever in prompt-generation mode; see GENERATION MODE in pageExtraction.ts. Never produced by faithful extraction. */
+export type CardFlashcardContent = { front: string; back: string; detail?: CardFlashcardDetail | null };
 /** 'grammar_rule' recipe: one rule statement + its examples — purpose-built "rule box" layout, not a generic paragraph. */
 export type CardGrammarRuleContent = { rule: string; examples?: string[] };
-export type CardDialogueContent = { turns: { speaker: string | null; text: string }[] };
-export type CardChoiceContent = { prompt: string; options: string[] };
+/** answer (per turn) is populated only when this is an interaction-kind dialogue with a blank in that turn's text, and only from an attached answer key — see answer_key_status on the card. */
+export type CardDialogueContent = { turns: { speaker: string | null; text: string; answer?: string | null }[] };
+/** correctOptions holds the index/indices (into options) of the correct answer(s) — populated only from an attached answer key, never guessed; null/absent means no answer key covered this card (see answer_key_status). */
+export type CardChoiceContent = { prompt: string; options: string[]; correctOptions?: number[] | null };
 export type CardTextInputField = { id: string; label?: string | null; prefix?: string | null; suffix?: string | null; placeholder?: string | null };
-/** 'text_input' recipe: template (inline blanks) and fields (labeled slots) are alternatives — set whichever fits; long hints at a full textarea instead of a single-line input. */
-export type CardTextInputContent = { prompt: string; template?: string | null; fields?: CardTextInputField[]; placeholder?: string | null; long?: boolean };
-export type CardMatchingContent = { prompt?: string | null; left: string[]; right: string[] };
-export type CardOrderingContent = { prompt?: string | null; items: string[] };
-/** 'categorize' recipe: sort each item into one of the named groups (click an item, then click its group) — e.g. groups ["masculin","féminin"], items ["chanteur","chanteuse",...]. */
-export type CardCategorizeContent = { prompt?: string | null; groups: string[]; items: string[] };
+/** 'text_input' recipe: template (inline blanks) and fields (labeled slots) are alternatives — set whichever fits; long hints at a full textarea instead of a single-line input. answers aligns to template's blanks in order, or to fields in order — populated only from an attached answer key (see answer_key_status), never for a 'long' open-ended prompt (no single correct answer). */
+export type CardTextInputContent = { prompt: string; template?: string | null; fields?: CardTextInputField[]; placeholder?: string | null; long?: boolean; answers?: string[] | null };
+/** correctPairs holds [leftIndex, rightIndex] pairs for the correct matching — populated only from an attached answer key. */
+export type CardMatchingContent = { prompt?: string | null; left: string[]; right: string[]; correctPairs?: [number, number][] | null };
+/** correctOrder holds the correct sequence of items' current indices (e.g. [2,0,1] means item 2 goes first) — populated only from an attached answer key. */
+export type CardOrderingContent = { prompt?: string | null; items: string[]; correctOrder?: number[] | null };
+/** 'categorize' recipe: sort each item into one of the named groups (click an item, then click its group) — e.g. groups ["masculin","féminin"], items ["chanteur","chanteuse",...]. correctGroups aligns to items, holding each item's correct index into groups — populated only from an attached answer key. */
+export type CardCategorizeContent = { prompt?: string | null; groups: string[]; items: string[]; correctGroups?: number[] | null };
 export type CardOpenTaskContent = { prompt: string; note?: string | null };
 
 // Legacy (pre-card-recipe) content shapes — still read by blockRenderers.ts
@@ -347,6 +321,7 @@ export type PageAudioRefContent = {
 export type PageBlockContent =
   | CardTextContent
   | CardVocabularyContent
+  | CardFlashcardContent
   | CardGrammarRuleContent
   | CardTableContent
   | CardDialogueContent
@@ -376,81 +351,81 @@ export type PageBlockKind = 'document' | 'interaction' | 'image_ref' | 'audio_re
 export type AnswerKeyStatus = 'available' | 'unavailable' | 'unknown';
 export type ActivityAudioReference = { label: string; status: 'matched' | 'unresolved' | 'unavailable' } | null;
 
+/** 'manual' = a plain authored/pasted card (fields below); 'textbook_extraction' = faithful, source-bound content from the import pipeline. The two content shapes below coexist on one row rather than being forced into a common shape — never assume both halves are populated at once. */
+export type CardOrigin = 'manual' | 'textbook_extraction';
+
 export type PageBlock = {
   id: string;
-  page_extraction_id: string;
-  page_id: string;
+  stack_id: string;
+  /** Denormalized (also reachable via stack_id -> stacks.deck_id) — kept directly on the row so ownership checks and deck-scoped queries never need to join through stacks. */
+  deck_id: string;
   order_index: number;
-  kind: PageBlockKind;
-  component_type: CardRecipe | LegacyCardComponentType | LegacyDocumentComponentType | LegacyInteractionComponentType | 'image_ref' | 'audio_ref' | string;
+  origin: CardOrigin;
+
+  // ---- textbook_extraction-only fields (null when origin === 'manual') ----
+  /** Denormalized page reference — a card generator should never need to join through stacks to find which page a block came from. */
+  source_page_id: string | null;
+  block_kind: PageBlockKind | null;
+  component_type: (CardRecipe | LegacyCardComponentType | LegacyDocumentComponentType | LegacyInteractionComponentType | 'image_ref' | 'audio_ref' | string) | null;
   /** Exercise/section number as printed on the page (e.g. "3"), for the card header — distinct from order_index. */
   section_number: string | null;
   title: string | null;
   instruction: string | null;
   /** BCP-47-ish language tag (e.g. "fr") — drives whether a pronunciation icon makes sense. */
   language: string | null;
-  source_line_ids: string[];
-  source_text: string;
-  content: PageBlockContent;
+  source_line_ids: string[] | null;
+  source_text: string | null;
+  content: PageBlockContent | null;
   /** A faithful, natural English translation of the card's content, generated separately from source_text — never a substitute for it, always additional, shown behind a toggle. Null when not available (e.g. legacy rows extracted before this existed). */
   translation: string | null;
   /** A closed semantic label (see CardCategory) driving icon/accent decoration we fully own — never model-authored CSS. */
   category: CardCategory;
+  answer_key_status: AnswerKeyStatus | null;
+  /** True only for a card produced by prompt-driven generation mode (admin instructions were attached at extraction time), regardless of its recipe — this, not component_type, is what gates the front/back flip in Practice/Study: faithful-extraction cards are never flipped, every generation-mode card is, whatever shape it takes. Always false for origin='manual' (those have their own, separate flip). */
+  prompt_generated: boolean;
+  pronunciation_enabled: boolean | null;
+  activity_audio_reference: ActivityAudioReference;
+  needs_review: boolean | null;
+  review_reason: string | null;
+  /** Per-card choice: when true and a source image exists, Study/Practice shows it alongside the card — defaults true so existing extracted cards keep today's always-shown behavior until someone opts out. Meaningless for a card with no source (origin='manual'). */
+  show_source_in_practice: boolean;
+  /** The learner's own in-progress answer for an interactive card (single_choice/matching_pairs/text_input/etc.), captured live in Study mode so it survives a re-render, a page reload, or coming back to this card later — see captureAnswerState/applyAnswerState in readModeRenderers.ts. Shape is recipe-specific (an internal detail of those two functions), never read/written anywhere else. Null when nothing's been entered yet, or for a recipe with nothing to capture. */
+  study_answer: Record<string, unknown> | null;
+
+  // ---- shared, always populated regardless of origin ----
   /** Open, growing, multi-value topic/skill classification (e.g. "food-and-drink", "present-tense") — see the `tags` table and TAGS in pageExtraction.ts. Independent of category. */
   tags: string[];
-  answer_key_status: AnswerKeyStatus;
-  pronunciation_enabled: boolean;
-  activity_audio_reference: ActivityAudioReference;
-  needs_review: boolean;
-  review_reason: string | null;
+
+  // ---- manual-only fields (null when origin === 'textbook_extraction') ----
+  note_type: NoteType | null;
+  fields: NoteFields | null;
+  review_status: ReviewStatus | null;
+  confidence: Confidence | null;
+  review_reasons: string[] | null;
+  source_evidence: SourceEvidence | null;
+  extraction_diagnostics: ExtractionDiagnostics | null;
+
+  // ---- FSRS scheduling — always populated, regardless of origin ----
+  state: CardState;
+  due: string;
+  difficulty: number | null;
+  stability: number | null;
+  reps: number;
+  lapses: number;
+  step: number;
+  last_review: string | null;
+
+  /** Gates the practice queue — a fresh manual card defaults true (studied immediately, as today); a fresh textbook_extraction card defaults false until explicitly sent to practice. */
+  include_in_practice: boolean;
   created_at: string;
   updated_at: string;
 };
 
-export type PageBlockInsert = Pick<PageBlock, 'page_extraction_id' | 'page_id' | 'order_index' | 'kind' | 'component_type'> &
-  Partial<
-    Pick<
-      PageBlock,
-      | 'section_number'
-      | 'title'
-      | 'instruction'
-      | 'language'
-      | 'source_line_ids'
-      | 'source_text'
-      | 'content'
-      | 'translation'
-      | 'category'
-      | 'tags'
-      | 'answer_key_status'
-      | 'pronunciation_enabled'
-      | 'activity_audio_reference'
-      | 'needs_review'
-      | 'review_reason'
-    >
-  >;
+export type PageBlockInsert = Pick<PageBlock, 'stack_id' | 'deck_id' | 'order_index' | 'origin'> &
+  Partial<Omit<PageBlock, 'id' | 'stack_id' | 'deck_id' | 'order_index' | 'origin' | 'created_at' | 'updated_at'>>;
 
-export type PageBlockUpdate = Partial<
-  Pick<
-    PageBlock,
-    | 'order_index'
-    | 'kind'
-    | 'component_type'
-    | 'section_number'
-    | 'title'
-    | 'instruction'
-    | 'language'
-    | 'source_line_ids'
-    | 'source_text'
-    | 'content'
-    | 'translation'
-    | 'category'
-    | 'answer_key_status'
-    | 'pronunciation_enabled'
-    | 'activity_audio_reference'
-    | 'needs_review'
-    | 'review_reason'
-  >
->;
+/** stack_id IS updatable here (unlike PageBlockInsert, where it's fixed at creation) — merging/unmerging stacks (see lib/stacks.ts) works by repointing existing cards' stack_id, never by re-inserting them. */
+export type PageBlockUpdate = Partial<Omit<PageBlock, 'id' | 'deck_id' | 'origin' | 'created_at' | 'updated_at'>>;
 
 // ---------- page extractions ----------
 
@@ -491,9 +466,17 @@ export type PageRepairAttempt = {
   issuesAfter: string[];
 };
 
+/** 'page' = has a source import_page shown side-by-side, faithful to it (source_page_id always set); 'custom' = no source (source_page_id always null) — a plain bundle of manually-authored cards, e.g. the single synthetic "Manual cards" stack every deck's pasted/JSON cards land in. */
+export type StackKind = 'page' | 'custom';
+
 export type PageExtraction = {
   id: string;
-  page_id: string;
+  /** Denormalized (also reachable via source_page_id -> import_pages -> imports.deck_id for a 'page' stack) — direct so a 'custom' stack (no source page at all) still has a deck owner. */
+  deck_id: string;
+  name: string;
+  kind: StackKind;
+  /** Set only when kind === 'page'. */
+  source_page_id: string | null;
   version: number;
   status: PageExtractionStatus;
   model: string | null;
@@ -512,6 +495,8 @@ export type PageExtraction = {
   approved_with_warnings: boolean;
   approval_override_reason: string | null;
 };
+
+export type Stack = PageExtraction;
 
 // ---------- image regions (detected on the page, independent of extraction) ----------
 
@@ -559,7 +544,7 @@ export type DeckTagCount = {
 
 // ---------- imports ----------
 
-/** Only 'textbook' is written by the current (page-first) import flow — 'corrige'/'transcription' are retained in the check constraint only for old rows, never offered in the UI. */
+/** 'textbook' is the main source (image/pdf/doc, one per import unless multiple files of the same kind). 'corrige' is an optional answer-key document attached alongside it in faithful-extraction mode, used to populate real answers on interaction cards — never a generation unit itself (see preprocessWorker.ts). 'transcription' is retained in the check constraint only for old rows, never offered in the UI. */
 export type ImportSourceType = 'textbook' | 'corrige' | 'transcription';
 export type ImportFileStatus = 'idle' | 'uploading' | 'completed' | 'failed';
 
@@ -588,11 +573,15 @@ export type Import = {
   last_progress_at: string | null;
   /** Admin-set test toggle: forces every page through image-only extraction (ignoring any embedded PDF text layer) — see preprocessWorker.ts. */
   force_image_only: boolean;
+  /** Optional free-text instructions shaping how every page of this import gets extracted — threaded into every page's initial extract_page job as admin_instructions (see preprocessWorker.ts). Null means faithful, unshaped extraction. */
+  custom_prompt: string | null;
+  /** The shared stack every one of this import's generation units files its cards under — set deterministically at creation for an image-only import (no real page concept to keep separate), created up front (see lib/imports.ts's createImport). Null for a pdf/doc import, which keeps one stack per page. */
+  merged_stack_id: string | null;
   created_at: string;
   updated_at: string;
 };
 
-export type ImportInsert = Pick<Import, 'deck_id' | 'title'> & Partial<Pick<Import, 'force_image_only'>>;
+export type ImportInsert = Pick<Import, 'deck_id' | 'title'> & Partial<Pick<Import, 'force_image_only' | 'custom_prompt' | 'merged_stack_id'>>;
 
 export type ImportFile = {
   id: string;
@@ -635,8 +624,10 @@ export type ImportPage = {
   height: number | null;
   /** Best-effort image XObject bounding boxes detected in the PDF's content stream. */
   image_regions: ImageRegion[];
-  /** Storage path (import-page-pdfs bucket) of this page sliced into its own single-page PDF — a byte-faithful copy, never a crop or recreation — attached to the extraction call as visual/structural context. Null when slicing failed (extraction then falls back to text-only). */
+  /** Storage path (import-page-pdfs bucket) of this page's visual attachment — a byte-faithful single-page PDF slice for a PDF source, or the original file directly for a plain-image source (see visual_mime_type) — attached to the extraction call as visual/structural context. Null when unavailable (extraction then falls back to text-only). */
   page_pdf_path: string | null;
+  /** Mime type of page_pdf_path's content — 'application/pdf' for the PDF-slice path every existing row uses, or a real image mime (e.g. 'image/png') for a source that was a plain image with no PDF at all. Drives which mime type extractWorker.ts attaches the visual as. */
+  visual_mime_type: string;
   created_at: string;
   updated_at: string;
 };
@@ -697,37 +688,16 @@ export type Database = {
         Update: DeckUpdate;
         Relationships: [];
       };
-      notes: {
-        Row: Note;
-        Insert: NoteInsert;
-        Update: Partial<NoteInsert>;
-        Relationships: [
-          {
-            foreignKeyName: 'notes_deck_id_fkey';
-            columns: ['deck_id'];
-            isOneToOne: false;
-            referencedRelation: 'decks';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'notes_source_block_id_fkey';
-            columns: ['source_block_id'];
-            isOneToOne: false;
-            referencedRelation: 'page_blocks';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
       cards: {
         Row: Card;
         Insert: CardInsert;
         Update: CardUpdate;
         Relationships: [
           {
-            foreignKeyName: 'cards_note_id_fkey';
-            columns: ['note_id'];
+            foreignKeyName: 'cards_stack_id_fkey';
+            columns: ['stack_id'];
             isOneToOne: false;
-            referencedRelation: 'notes';
+            referencedRelation: 'stacks';
             referencedColumns: ['id'];
           },
           {
@@ -735,6 +705,13 @@ export type Database = {
             columns: ['deck_id'];
             isOneToOne: false;
             referencedRelation: 'decks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'cards_source_page_id_fkey';
+            columns: ['source_page_id'];
+            isOneToOne: false;
+            referencedRelation: 'import_pages';
             referencedColumns: ['id'];
           },
         ];
@@ -838,9 +815,9 @@ export type Database = {
           },
         ];
       };
-      page_extractions: {
+      stacks: {
         Row: PageExtraction;
-        Insert: Partial<PageExtraction> & Pick<PageExtraction, 'page_id' | 'version'>;
+        Insert: Partial<PageExtraction> & Pick<PageExtraction, 'deck_id' | 'name' | 'kind'>;
         Update: Partial<
           Pick<
             PageExtraction,
@@ -855,35 +832,23 @@ export type Database = {
             | 'unresolved_warnings'
             | 'reviewed_at'
             | 'reviewed_by'
+            | 'approved_with_warnings'
+            | 'approval_override_reason'
           >
         >;
         Relationships: [
           {
-            foreignKeyName: 'page_extractions_page_id_fkey';
-            columns: ['page_id'];
+            foreignKeyName: 'stacks_source_page_id_fkey';
+            columns: ['source_page_id'];
             isOneToOne: false;
             referencedRelation: 'import_pages';
             referencedColumns: ['id'];
           },
-        ];
-      };
-      page_blocks: {
-        Row: PageBlock;
-        Insert: PageBlockInsert;
-        Update: PageBlockUpdate;
-        Relationships: [
           {
-            foreignKeyName: 'page_blocks_page_extraction_id_fkey';
-            columns: ['page_extraction_id'];
+            foreignKeyName: 'stacks_deck_id_fkey';
+            columns: ['deck_id'];
             isOneToOne: false;
-            referencedRelation: 'page_extractions';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'page_blocks_page_id_fkey';
-            columns: ['page_id'];
-            isOneToOne: false;
-            referencedRelation: 'import_pages';
+            referencedRelation: 'decks';
             referencedColumns: ['id'];
           },
         ];

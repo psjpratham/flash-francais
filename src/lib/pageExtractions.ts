@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import type { ImportPage, NoteFields, PageBlock, PageBlockUpdate, PageExtraction } from '../types';
+import type { CardWithNote, ImportPage, PageBlock, PageBlockUpdate, PageExtraction } from '../types';
 
 const JOB_TYPE = 'extract_page';
 
@@ -139,8 +139,25 @@ async function fetchJobRows(importId: string): Promise<JobRow[]> {
   return data as unknown as JobRow[];
 }
 
+/**
+ * requeuePageExtraction inserts a fresh job row per retry rather than
+ * reusing the old one (that old row is kept, at whatever terminal status it
+ * ended at, as a genuine attempt-history record) — so a page can have
+ * several job rows over time. Only the most recent one per page reflects
+ * that page's current state; an old 'failed' row from before a successful
+ * retry must never be counted again.
+ */
+function latestJobPerPage(rows: JobRow[]): JobRow[] {
+  const latestByPage = new Map<string, JobRow>();
+  for (const row of rows) {
+    const current = latestByPage.get(row.payload.page_id);
+    if (!current || new Date(row.created_at).getTime() > new Date(current.created_at).getTime()) latestByPage.set(row.payload.page_id, row);
+  }
+  return [...latestByPage.values()];
+}
+
 export async function getExtractionProgress(importId: string): Promise<ExtractionProgress> {
-  const rows = await fetchJobRows(importId);
+  const rows = latestJobPerPage(await fetchJobRows(importId));
   const progress: ExtractionProgress = { queued: 0, processing: 0, stale: 0, completed: 0, failed: 0, total: rows.length };
   for (const row of rows) {
     if (row.status === 'queued') progress.queued++;
@@ -212,9 +229,9 @@ export async function requeueStaleExtractionJobs(importId: string): Promise<numb
 /** The current (max-version) extraction for a page, or null if it hasn't been extracted yet. */
 export async function getCurrentPageExtraction(pageId: string): Promise<PageExtraction | null> {
   const { data, error } = await supabase
-    .from('page_extractions')
+    .from('stacks')
     .select('*')
-    .eq('page_id', pageId)
+    .eq('source_page_id', pageId)
     .order('version', { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -224,37 +241,102 @@ export async function getCurrentPageExtraction(pageId: string): Promise<PageExtr
 
 export async function listPageBlocks(pageExtractionId: string): Promise<PageBlock[]> {
   const { data, error } = await supabase
-    .from('page_blocks')
+    .from('cards')
     .select('*')
-    .eq('page_extraction_id', pageExtractionId)
+    .eq('stack_id', pageExtractionId)
     .order('order_index', { ascending: true });
   if (error) throw error;
   return data;
 }
 
+/**
+ * Every card belonging to one specific page, found by its durable
+ * `source_page_id` rather than by whichever stack currently claims them.
+ * This is what Manage/edit (pageReview.ts) uses instead of listPageBlocks —
+ * a merged import files a page's cards under a shared stack (see
+ * extractWorker.ts), so "this page's stack" and "the stack these cards
+ * currently live in" can differ; source_page_id never changes regardless,
+ * so it's the only reliable way to find "this page's cards" for editing.
+ */
+export async function listCardsForSourcePage(pageId: string): Promise<PageBlock[]> {
+  const { data, error } = await supabase.from('cards').select('*').eq('source_page_id', pageId).order('order_index', { ascending: true });
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Every card across several stacks, each carrying its own source image path
+ * — Study mode's data source when more than one stack is selected. Cards
+ * come back grouped by stack in the same order stackIds was given (the
+ * Stacks browser's own display order), then by order_index within each
+ * stack, so a multi-stack study walk reads in the same order as the browser
+ * showed them. An optional tag filter narrows within that same selection —
+ * Study's equivalent of the old deck-wide tag filter, scoped to what was
+ * actually selected rather than the whole deck.
+ */
+export async function listCardsForStacks(stackIds: string[], tags?: string[]): Promise<CardWithNote[]> {
+  if (!stackIds.length) return [];
+  let query = supabase
+    .from('cards')
+    .select('*,import_pages(rendered_page_path)')
+    .in('stack_id', stackIds)
+    .order('order_index', { ascending: true });
+  if (tags?.length) query = query.overlaps('tags', tags);
+  const { data, error } = await query;
+  if (error) throw error;
+
+  const orderOf = new Map(stackIds.map((id, i) => [id, i]));
+  return [...(data as CardWithNote[])].sort((a, b) => {
+    const stackOrder = (orderOf.get(a.stack_id) ?? 0) - (orderOf.get(b.stack_id) ?? 0);
+    return stackOrder !== 0 ? stackOrder : a.order_index - b.order_index;
+  });
+}
+
 export async function updatePageBlock(blockId: string, patch: PageBlockUpdate): Promise<PageBlock> {
-  const { data, error } = await supabase.from('page_blocks').update(patch).eq('id', blockId).select().single();
+  const { data, error } = await supabase.from('cards').update(patch).eq('id', blockId).select().single();
   if (error) throw error;
   return data;
 }
 
 export async function deletePageBlock(blockId: string): Promise<void> {
-  const { error } = await supabase.from('page_blocks').delete().eq('id', blockId);
+  const { error } = await supabase.from('cards').delete().eq('id', blockId);
   if (error) throw error;
 }
 
-/** Inserts a new manually-added block at the given order_index — callers are responsible for shifting other blocks' order_index first if inserting mid-page. */
+/**
+ * Inserts a new manually-added block at the given order_index — callers are
+ * responsible for shifting other blocks' order_index first if inserting
+ * mid-page. `stack_id` is whichever stack this page's OTHER cards currently
+ * live in (its own per-page stack normally, or the shared merged stack if
+ * this import was merged) — callers derive it from an existing sibling
+ * card rather than assuming it always equals the page's own stack.
+ */
 export async function insertPageBlock(block: {
-  page_extraction_id: string;
+  stack_id: string;
   page_id: string;
+  deck_id: string;
   order_index: number;
-  kind: PageBlock['kind'];
+  kind: NonNullable<PageBlock['block_kind']>;
   component_type: string;
   content: PageBlock['content'];
 }): Promise<PageBlock> {
   const { data, error } = await supabase
-    .from('page_blocks')
-    .insert({ ...block, source_line_ids: [], source_text: '', needs_review: true, review_reason: 'manually added during review' })
+    .from('cards')
+    .insert({
+      stack_id: block.stack_id,
+      source_page_id: block.page_id,
+      deck_id: block.deck_id,
+      order_index: block.order_index,
+      origin: 'textbook_extraction',
+      block_kind: block.kind,
+      component_type: block.component_type,
+      content: block.content,
+      source_line_ids: [],
+      source_text: '',
+      needs_review: true,
+      review_reason: 'manually added during review',
+      include_in_practice: false,
+    })
     .select()
     .single();
   if (error) throw error;
@@ -263,91 +345,116 @@ export async function insertPageBlock(block: {
 
 export async function reorderPageBlocks(updates: { id: string; order_index: number }[]): Promise<void> {
   for (const u of updates) {
-    const { error } = await supabase.from('page_blocks').update({ order_index: u.order_index }).eq('id', u.id);
+    const { error } = await supabase.from('cards').update({ order_index: u.order_index }).eq('id', u.id);
     if (error) throw error;
   }
 }
 
 // ---------- sending reviewed blocks to practice ----------
 
-/** Plain-text fallback shown wherever a note's fields are read directly (search, the old flashcard UI) — the actual session rendering for these notes uses the live source_block_id join instead, not these fields. */
-function blockToNoteFields(b: PageBlock): NoteFields {
-  const front = b.title || b.instruction || b.source_text.slice(0, 160) || '(imported card)';
-  return { front, back: b.translation ?? '' };
-}
-
-/** How many of a page's current blocks already have a practice note (for the review UI's "N/M sent" state). */
+/** How many of a page's current blocks are already marked for practice (for the review UI's "N/M sent" state). */
 export async function countBlocksSentToPractice(pageBlockIds: string[]): Promise<number> {
   if (!pageBlockIds.length) return 0;
   const { count, error } = await supabase
-    .from('notes')
+    .from('cards')
     .select('id', { count: 'exact', head: true })
-    .in('source_block_id', pageBlockIds);
+    .in('id', pageBlockIds)
+    .eq('include_in_practice', true);
   if (error) throw error;
   return count ?? 0;
 }
 
 /**
- * Compiles a page's current blocks (in their current, admin-reordered
- * order_index) into practice notes+cards, one each, skipping any block
- * that's already been sent — safe to click again after adding/reordering
- * blocks on an already-sent page. Reuses the exact same FSRS 'new' card
- * shape bulkInsertNotesAndCards uses for manually-authored cards.
+ * Toggles one card's practice inclusion. Resets it to a fresh 'new' FSRS
+ * card only when flipping OFF -> ON (matching sendPageBlocksToPractice's
+ * bulk behavior) — flipping ON -> ON (or any OFF) never touches FSRS state,
+ * so a card the student has already studied never loses progress from a
+ * stray re-check.
  */
-export async function sendPageBlocksToPractice(pageId: string, deckId: string): Promise<{ sent: number; alreadySent: number }> {
-  const { data: blocks, error: blocksError } = await supabase.from('page_blocks').select('*').eq('page_id', pageId).order('order_index', { ascending: true });
+export async function setCardIncludeInPractice(blockId: string, include: boolean, wasIncluded: boolean): Promise<PageBlock> {
+  const patch: PageBlockUpdate =
+    include && !wasIncluded ? { include_in_practice: true, state: 'new', due: new Date().toISOString() } : { include_in_practice: include };
+  const { data, error } = await supabase.from('cards').update(patch).eq('id', blockId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+/** Persists one interactive card's in-progress Study mode answer (see captureAnswerState in readModeRenderers.ts) — best-effort, fire-and-forget from the caller's point of view; a save failure just means that keystroke isn't backed up yet, never a blocking error for the learner. */
+export async function updateCardStudyAnswer(blockId: string, state: Record<string, unknown> | null): Promise<void> {
+  const { error } = await supabase.from('cards').update({ study_answer: state }).eq('id', blockId);
+  if (error) throw error;
+}
+
+/** Wipes saved Study-mode answers for a set of cards — the "clear before studying" option offered at the start of a Study session. */
+export async function clearStudyAnswersForCards(cardIds: string[]): Promise<void> {
+  if (!cardIds.length) return;
+  const { error } = await supabase.from('cards').update({ study_answer: null }).in('id', cardIds);
+  if (error) throw error;
+}
+
+/** Per-card choice: whether Study/Practice shows this card's source image alongside it — independent of include_in_practice. */
+export async function setCardShowSourceInPractice(blockId: string, show: boolean): Promise<PageBlock> {
+  const { data, error } = await supabase.from('cards').update({ show_source_in_practice: show }).eq('id', blockId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Marks a page's current blocks (in their current, admin-reordered
+ * order_index) as included in practice — skipping any block that's already
+ * marked, so a card the student has already studied never has its FSRS
+ * progress reset by a second click after adding/reordering blocks on an
+ * already-sent page.
+ */
+export async function sendPageBlocksToPractice(pageId: string): Promise<{ sent: number; alreadySent: number }> {
+  const { data: blocks, error: blocksError } = await supabase
+    .from('cards')
+    .select('id, include_in_practice')
+    .eq('source_page_id', pageId)
+    .order('order_index', { ascending: true });
   if (blocksError) throw blocksError;
   if (!blocks?.length) return { sent: 0, alreadySent: 0 };
 
-  const { data: existingNotes, error: existingError } = await supabase
-    .from('notes')
-    .select('source_block_id')
-    .in(
-      'source_block_id',
-      blocks.map((b) => b.id),
-    );
-  if (existingError) throw existingError;
-  const alreadySentIds = new Set((existingNotes ?? []).map((n) => n.source_block_id));
-  const toSend = blocks.filter((b) => !alreadySentIds.has(b.id));
+  const toSend = blocks.filter((b) => !b.include_in_practice);
   if (!toSend.length) return { sent: 0, alreadySent: blocks.length };
 
-  const { data: noteRows, error: notesError } = await supabase
-    .from('notes')
-    .insert(
-      toSend.map((b) => ({
-        deck_id: deckId,
-        note_type: 'basic' as const,
-        tags: b.tags,
-        fields: blockToNoteFields(b),
-        source_block_id: b.id,
-      })),
-    )
-    .select();
-  if (notesError) throw notesError;
-
-  const cardRows = noteRows.map((n) => ({ note_id: n.id, deck_id: deckId, state: 'new' as const, due: new Date().toISOString() }));
-  const { error: cardsError } = await supabase.from('cards').insert(cardRows);
-  if (cardsError) throw cardsError;
+  const { error: updateError } = await supabase
+    .from('cards')
+    .update({ include_in_practice: true, state: 'new', due: new Date().toISOString() })
+    .in(
+      'id',
+      toSend.map((b) => b.id),
+    );
+  if (updateError) throw updateError;
 
   return { sent: toSend.length, alreadySent: blocks.length - toSend.length };
 }
 
-/** Approves a page's current extraction — blocked server-side (see approve_page_extraction RPC) while unresolved_warnings is non-empty. */
-/** Approves a page's current extraction. If it has unresolved warnings, `force` + a non-empty `overrideReason` are required — the server rejects it otherwise, so the override is always deliberate and always recorded. */
-export async function approvePageExtraction(pageExtractionId: string, force = false, overrideReason?: string): Promise<PageExtraction> {
-  const { data, error } = await supabase.rpc('approve_page_extraction', {
-    p_page_extraction_id: pageExtractionId,
-    p_force: force,
-    p_override_reason: overrideReason ?? null,
-  });
-  if (error) throw error;
-  return data;
+/** The reverse of sendPageBlocksToPractice — pulls this page's cards back out of practice. FSRS scheduling state is left untouched (only include_in_practice flips off), so re-including later just resumes wherever the card's due/state already were. */
+export async function removePageBlocksFromPractice(pageId: string): Promise<{ removed: number }> {
+  const { data: blocks, error: blocksError } = await supabase.from('cards').select('id, include_in_practice').eq('source_page_id', pageId);
+  if (blocksError) throw blocksError;
+  if (!blocks?.length) return { removed: 0 };
+
+  const toRemove = blocks.filter((b) => b.include_in_practice);
+  if (!toRemove.length) return { removed: 0 };
+
+  const { error: updateError } = await supabase
+    .from('cards')
+    .update({ include_in_practice: false })
+    .in(
+      'id',
+      toRemove.map((b) => b.id),
+    );
+  if (updateError) throw updateError;
+
+  return { removed: toRemove.length };
 }
 
 /** Whether this import has any page extraction yet — used to surface "Review pages" as soon as one page finishes. */
 export async function hasAnyPageExtractions(importId: string): Promise<boolean> {
   const { count, error } = await supabase
-    .from('page_extractions')
+    .from('stacks')
     .select('id, import_pages!inner(import_id)', { count: 'exact', head: true })
     .eq('import_pages.import_id', importId);
   if (error) throw error;
@@ -364,15 +471,15 @@ export interface PageReviewCounts {
 /** Per-page review status, counting only each page's current (max-version) extraction — never double-counts a retried page's old versions. */
 export async function getPageReviewCounts(importId: string): Promise<PageReviewCounts> {
   const { data, error } = await supabase
-    .from('page_extractions')
-    .select('page_id, version, status, import_pages!inner(import_id)')
+    .from('stacks')
+    .select('source_page_id, version, status, import_pages!inner(import_id)')
     .eq('import_pages.import_id', importId);
   if (error) throw error;
 
   const latestByPage = new Map<string, { version: number; status: string }>();
-  for (const row of data as unknown as { page_id: string; version: number; status: string }[]) {
-    const current = latestByPage.get(row.page_id);
-    if (!current || row.version > current.version) latestByPage.set(row.page_id, { version: row.version, status: row.status });
+  for (const row of data as unknown as { source_page_id: string; version: number; status: string }[]) {
+    const current = latestByPage.get(row.source_page_id);
+    if (!current || row.version > current.version) latestByPage.set(row.source_page_id, { version: row.version, status: row.status });
   }
 
   const counts: PageReviewCounts = { needsReview: 0, approved: 0, failed: 0, pending: 0 };

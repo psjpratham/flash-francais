@@ -87,18 +87,23 @@ describe('loadQueueForDeck', () => {
     )!;
     expect(dueCalls.find((c) => c.method === 'limit')?.args).toEqual([5]);
     expect(newCalls.find((c) => c.method === 'limit')?.args).toEqual([3]);
-    // no tag filter requested -> no !inner join, no overlaps call
-    expect(dueCalls.some((c) => c.method === 'overlaps')).toBe(false);
-    expect(dueCalls.find((c) => c.method === 'select')?.args[0]).not.toContain('!inner');
   });
 
-  it('filters by tags via notes!inner + overlaps when tags are passed', async () => {
+  it('never filters by tag or anything else — Practice is deliberately unfilterable', async () => {
     const deck = testDeck();
-    await loadQueueForDeck(deck, ['grammar', 'unit3']);
+    await loadQueueForDeck(deck);
 
     for (const calls of builderLog) {
-      expect(calls.find((c) => c.method === 'select')?.args[0]).toContain('notes!inner');
-      expect(calls.find((c) => c.method === 'overlaps')?.args).toEqual(['notes.tags', ['grammar', 'unit3']]);
+      expect(calls.some((c) => c.method === 'overlaps')).toBe(false);
+    }
+  });
+
+  it('only ever queries cards marked include_in_practice', async () => {
+    const deck = testDeck();
+    await loadQueueForDeck(deck);
+
+    for (const calls of builderLog) {
+      expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'include_in_practice' && c.args[1] === true)).toBe(true);
     }
   });
 });

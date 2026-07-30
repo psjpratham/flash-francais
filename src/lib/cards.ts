@@ -1,47 +1,61 @@
 import { supabase } from './supabase';
 import { scheduleCard } from './fsrs';
-import type { Card, CardWithNote, Deck, Note, NoteFields, NoteType, Rating } from '../types';
-
-// The page_blocks/import_pages embed is only ever non-null for a note
-// compiled from an import (source_block_id set) — see sendPageBlocksToPractice
-// in pageExtractions.ts. Live-referenced, not snapshotted: relies on the
-// querying user passing page_blocks' own RLS (admin + import owner), which
-// holds today because the same person creates and studies their imports.
-const NOTES_SELECT = 'fields,note_type,tags,source_block_id,page_blocks(*,import_pages(rendered_page_path))';
+import type { Card, CardWithNote, Deck, NoteFields, NoteType, Rating } from '../types';
 
 /** One card to import: optional note_type/tags, plus the note's fields (front/back/etc). */
-export type ImportItem = Partial<Pick<Note, 'note_type' | 'tags'>> & NoteFields;
+export type ImportItem = { note_type?: NoteType; tags?: string[] } & NoteFields;
 
-/** Inserts notes + their initial `new` cards in batches of 80, matching the old prototype. */
+const MANUAL_STACK_NAME = 'Manual cards';
+
+/**
+ * Every deck's manually/paste/JSON-authored cards live in one synthetic
+ * 'custom' stack — created lazily on first use. Looked up by name, not just
+ * kind='custom': a deck can now also have an image-source import's shared
+ * stack (see createImport in imports.ts), which is ALSO kind='custom' —
+ * matching on kind alone would grab whichever custom stack happens to exist
+ * first and silently file manual cards into the wrong one.
+ */
+async function getOrCreateManualStack(deckId: string): Promise<string> {
+  const { data: existing, error } = await supabase
+    .from('stacks')
+    .select('id')
+    .eq('deck_id', deckId)
+    .eq('kind', 'custom')
+    .eq('name', MANUAL_STACK_NAME)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (existing) return existing.id;
+
+  const { data: created, error: createError } = await supabase.from('stacks').insert({ deck_id: deckId, name: MANUAL_STACK_NAME, kind: 'custom', version: 1 }).select('id').single();
+  if (createError) throw createError;
+  return created.id;
+}
+
+/** Inserts cards (origin='manual') in batches of 80, matching the old prototype's note+card insert. */
 export async function bulkInsertNotesAndCards(
   deckId: string,
   defaultNoteType: NoteType,
   items: ImportItem[],
 ): Promise<void> {
+  const stackId = await getOrCreateManualStack(deckId);
   const BATCH = 80;
   for (let i = 0; i < items.length; i += BATCH) {
     const batch = items.slice(i, i + BATCH);
-    const { data: noteRows, error: notesError } = await supabase
-      .from('notes')
-      .insert(
-        batch.map(({ note_type, tags, ...fields }) => ({
-          deck_id: deckId,
-          note_type: note_type ?? defaultNoteType,
-          tags: tags ?? [],
-          fields,
-        })),
-      )
-      .select();
-    if (notesError) throw notesError;
-
-    const cardRows = noteRows.map((n) => ({
-      note_id: n.id,
-      deck_id: deckId,
-      state: 'new' as const,
-      due: new Date().toISOString(),
-    }));
-    const { error: cardsError } = await supabase.from('cards').insert(cardRows);
-    if (cardsError) throw cardsError;
+    const { error } = await supabase.from('cards').insert(
+      batch.map(({ note_type, tags, ...fields }, idx) => ({
+        stack_id: stackId,
+        deck_id: deckId,
+        order_index: i + idx,
+        origin: 'manual' as const,
+        note_type: note_type ?? defaultNoteType,
+        tags: tags ?? [],
+        fields,
+        state: 'new' as const,
+        due: new Date().toISOString(),
+      })),
+    );
+    if (error) throw error;
   }
 }
 
@@ -53,37 +67,57 @@ function shuffle<T>(arr: T[]): T[] {
   return arr;
 }
 
-/** Builds a study queue for a deck: due cards + new cards (up to the deck's daily limits), lightly shuffled. */
-export async function loadQueueForDeck(deck: Deck, tags?: string[]): Promise<CardWithNote[]> {
+/**
+ * Builds a practice queue for a deck: due cards + new cards (up to the
+ * deck's daily limits), lightly shuffled. Only cards explicitly marked
+ * include_in_practice ever enter the queue — a never-sent imported card
+ * must stay invisible here.
+ *
+ * Deliberately no filtering of any kind (no tags, no stack scoping) — the
+ * whole point of Practice is that the student doesn't curate what's due,
+ * the scheduler does. Picking *what's eligible at all* happens earlier and
+ * separately, per card, via include_in_practice (set from Manage). Curating
+ * *what to look at* without scheduling is what Study mode is for instead —
+ * see studyMode.ts, which is where stack/tag selection actually lives now.
+ */
+export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
   const nowISO = new Date().toISOString();
-  const filterByTags = !!tags?.length;
-  const notesRelation = filterByTags ? `notes!inner(${NOTES_SELECT})` : `notes(${NOTES_SELECT})`;
 
-  let dueQuery = supabase
+  const dueQuery = supabase
     .from('cards')
-    .select(`*,${notesRelation}`)
+    .select('*,import_pages(rendered_page_path)')
     .eq('deck_id', deck.id)
+    .eq('include_in_practice', true)
     .neq('state', 'new')
     .lte('due', nowISO)
     .order('due', { ascending: true })
     .limit(deck.review_per_day);
-  let newQuery = supabase
+  const newQuery = supabase
     .from('cards')
-    .select(`*,${notesRelation}`)
+    .select('*,import_pages(rendered_page_path)')
     .eq('deck_id', deck.id)
+    .eq('include_in_practice', true)
     .eq('state', 'new')
     .order('created_at', { ascending: true })
     .limit(deck.new_per_day);
-  if (filterByTags) {
-    dueQuery = dueQuery.overlaps('notes.tags', tags!);
-    newQuery = newQuery.overlaps('notes.tags', tags!);
-  }
 
   const [dueRes, newRes] = await Promise.all([dueQuery, newQuery]);
   if (dueRes.error) throw dueRes.error;
   if (newRes.error) throw newRes.error;
 
-  return shuffle([...dueRes.data, ...newRes.data]);
+  return shuffle([...dueRes.data, ...newRes.data]) as CardWithNote[];
+}
+
+/**
+ * Global practice: every deck's due+new pool, pulled independently (each
+ * deck keeps its own daily limits) and combined into one shuffled queue —
+ * the cross-deck counterpart to loadQueueForDeck, same "zero configuration"
+ * rule. Skips decks with nothing ready, so one slow query for an empty deck
+ * never blocks the rest.
+ */
+export async function loadQueueAcrossAllDecks(decks: Deck[]): Promise<CardWithNote[]> {
+  const queues = await Promise.all(decks.map((d) => loadQueueForDeck(d)));
+  return shuffle(queues.flat());
 }
 
 /** Schedules the card via FSRS, persists the new card state, and logs the review. */

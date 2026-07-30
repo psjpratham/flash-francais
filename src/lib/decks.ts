@@ -18,9 +18,15 @@ export async function withDeckCounts(decks: Deck[]): Promise<DeckWithCounts[]> {
           .from('cards')
           .select('id', { count: 'exact', head: true })
           .eq('deck_id', d.id)
+          .eq('include_in_practice', true)
           .neq('state', 'new')
           .lte('due', nowISO),
-        supabase.from('cards').select('id', { count: 'exact', head: true }).eq('deck_id', d.id).eq('state', 'new'),
+        supabase
+          .from('cards')
+          .select('id', { count: 'exact', head: true })
+          .eq('deck_id', d.id)
+          .eq('include_in_practice', true)
+          .eq('state', 'new'),
       ]);
       if (dueRes.error) throw dueRes.error;
       if (newRes.error) throw newRes.error;
@@ -102,10 +108,11 @@ export async function fetchDeckTags(deckId: string): Promise<DeckTagCount[]> {
 }
 
 /**
- * Permanently deletes a deck and everything under it: cards, notes, review
- * logs, imports, import_files, import_pages, page_extractions, page_blocks,
- * import_audio_files, jobs, and the uploaded files/renders in the three
- * private storage buckets (import-sources, import-audio, import-page-renders).
+ * Permanently deletes a deck and everything under it: cards (both manual and
+ * textbook-derived, unified — see migration 20260728000000), review logs,
+ * stacks, imports, import_files, import_pages, import_audio_files, jobs, and
+ * the uploaded files/renders in the three private storage buckets
+ * (import-sources, import-audio, import-page-renders).
  *
  * Every dependent table's deck_id (or transitive) foreign key is already
  * ON DELETE CASCADE (verified against the live schema — see the deck

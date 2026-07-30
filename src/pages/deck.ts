@@ -1,40 +1,33 @@
-import { deleteDeckDeep, fetchDeckStats, fetchDeckTags, getDeckWithCounts } from '../lib/decks';
-import { listImportsForDeck } from '../lib/imports';
-import { computeTextbookImportProgress, type TextbookImportProgress } from '../lib/importProgress';
-import type { DeckStatsWithStreak, DeckTagCount, DeckWithCounts, Import } from '../types';
+import { deleteDeckDeep, fetchDeckStats, getDeckWithCounts } from '../lib/decks';
+import type { DeckStatsWithStreak, DeckWithCounts } from '../types';
 import { $, errMsg, esc, toast } from '../lib/dom';
 import { accuracyPct, statsMoreHTML } from './statsPanel';
 
 export interface DeckDetailDeps {
   onBack: () => void;
-  onStartSession: (deck: DeckWithCounts, tagFilter: string[]) => void;
-  /** Opens the durable import-detail route for one specific import — never "the latest", always a real import_id. */
-  onOpenImport: (deckId: string, deckName: string, importId: string) => void;
+  /** Practice is deliberately unfilterable — whatever's due, deck-wide. Picking what to look at is Study mode's job (onOpenStudyPicker), a separate front door. */
+  onStartSession: (deck: DeckWithCounts) => void;
+  /** Opens the Study picker — choose which stack(s), optionally narrowed by tag, to walk through with no scheduling. */
+  onOpenStudyPicker: (deckId: string, deckName: string) => void;
   /** Current signed-in user's id — only the deck's owner sees/can use Delete deck or Import content. */
   currentUserId: string;
   /** Fired after the deck is successfully deleted; caller should return to the (refreshed) library. */
   onDeleted: () => void;
   /** Opens the unified, deck-scoped import flow (textbook or cards/JSON) — always this deck, never creates another. */
   onImportContent: (deckId: string, deckName: string) => void;
-}
-
-interface ImportRow {
-  imp: Import;
-  progress: TextbookImportProgress;
+  /** Opens the Manage-content browser for this deck (grouped stacks, status, edit — no study/selection here). */
+  onOpenStacks: (deckId: string, deckName: string) => void;
 }
 
 export async function renderDeckDetail(container: HTMLElement, deckId: string, deps: DeckDetailDeps): Promise<void> {
   let deck: DeckWithCounts | null = null;
-  let showTagFilter = false;
-  let tagFilter: string[] = [];
-  let deckTags: DeckTagCount[] | null = null;
   let statsData: DeckStatsWithStreak | null = null;
   let showMoreStats = false;
   let showDeleteConfirm = false;
   let deleteConfirmText = '';
   let deleting = false;
   let deleteError: string | null = null;
-  let importRows: ImportRow[] | null = null;
+  let showOverflowMenu = false;
 
   async function load(): Promise<void> {
     try {
@@ -46,70 +39,69 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
     }
     render();
     await loadStats();
-    if (deck.user_id === deps.currentUserId) await loadImports();
-  }
-
-  async function loadImports(): Promise<void> {
-    try {
-      const imports = await listImportsForDeck(deckId);
-      importRows = await Promise.all(
-        imports.map(async (imp) => ({ imp, progress: await computeTextbookImportProgress(imp.id) })),
-      );
-    } catch (e) {
-      toast('Could not load imports: ' + errMsg(e));
-      importRows = [];
-    }
-    renderImportsSection();
   }
 
   function render(): void {
     if (!deck) return;
-    const filterActive = tagFilter.length > 0;
     const isOwner = deck.user_id === deps.currentUserId;
     container.innerHTML = `
       <div class="wrap">
         <button class="back-link" id="backBtn">← Decks</button>
         <div class="page-h"><h1>${esc(deck.name)}</h1><p>${deck._due} due · ${deck._new} new</p></div>
 
-        <button class="hero-cta" id="startSessionBtn">
-          <span class="hero-cta-main">▶ Start session</span>
-          <span class="hero-cta-sub">${
-            filterActive ? 'Filtered: ' + esc(tagFilter.join(', ')) : `${deck._due + deck._new} cards ready`
-          }</span>
-        </button>
+        <div class="hero-row">
+          <button class="hero-cta hero-cta-practice" id="startSessionBtn">
+            <span class="hero-cta-main">▶ Practice Mode</span>
+            <span class="hero-cta-sub">${deck._due + deck._new} cards ready</span>
+          </button>
+          <button class="hero-cta hero-cta-study" id="openStudyPickerBtn">
+            <span class="hero-cta-main">📖 Study Mode</span>
+            <span class="hero-cta-sub">Read through any stack, no scheduling</span>
+          </button>
+        </div>
 
         <div class="row" style="justify-content:center;margin-top:14px">
-          <button class="btn-sec" id="toggleTagFilterBtn">🏷️ ${filterActive ? `Filter (${tagFilter.length})` : 'Filter by tag'}</button>
-          ${isOwner ? `<button class="btn-sec" id="importContentBtn">📥 Import content</button>` : ''}
-          ${isOwner ? `<button class="btn-danger" id="deleteDeckBtn">🗑 Delete deck</button>` : ''}
+          <button class="btn-sec" id="openStacksBtn">📦 Manage content</button>
+          ${
+            isOwner
+              ? `<div class="toolbar-more">
+                   <button class="btn-sec" id="deckMoreBtn">⋯</button>
+                   ${
+                     showOverflowMenu
+                       ? `<div class="toolbar-more-menu">
+                            <button class="btn-sec" id="importContentBtn">📥 Import content</button>
+                            <button class="btn-sec" id="deleteDeckBtn">🗑 Delete deck</button>
+                          </div>`
+                       : ''
+                   }
+                 </div>`
+              : ''
+          }
         </div>
 
         <div id="deleteDeckSection" style="margin-top:18px"></div>
-
-        <div id="tagFilterSection" class="${showTagFilter ? '' : 'hide'}" style="margin-top:18px"></div>
-
-        ${isOwner ? '<div id="importsSection" style="margin-top:18px"></div>' : ''}
 
         <div id="deckStats" style="margin-top:18px"><div class="stats-loading">Crunching numbers…</div></div>
       </div>`;
 
     $(container, '#backBtn').addEventListener('click', deps.onBack);
-    $(container, '#startSessionBtn').addEventListener('click', () => deps.onStartSession(deck!, tagFilter));
-    $(container, '#toggleTagFilterBtn').addEventListener('click', () => {
-      showTagFilter = !showTagFilter;
+    $(container, '#startSessionBtn').addEventListener('click', () => deps.onStartSession(deck!));
+    $(container, '#openStudyPickerBtn').addEventListener('click', () => deps.onOpenStudyPicker(deck!.id, deck!.name));
+    document.getElementById('openStacksBtn')?.addEventListener('click', () => deps.onOpenStacks(deck!.id, deck!.name));
+    document.getElementById('deckMoreBtn')?.addEventListener('click', () => {
+      showOverflowMenu = !showOverflowMenu;
       render();
     });
     document.getElementById('importContentBtn')?.addEventListener('click', () => deps.onImportContent(deck!.id, deck!.name));
     document.getElementById('deleteDeckBtn')?.addEventListener('click', () => {
+      showOverflowMenu = false;
       showDeleteConfirm = true;
       deleteConfirmText = '';
       deleteError = null;
       render();
     });
 
-    if (showTagFilter) void renderTagFilterSection();
     renderStatsSection();
-    if (isOwner) renderImportsSection();
     renderDeleteDeckSection();
   }
 
@@ -170,113 +162,12 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
     }
   }
 
-  // ---------- document imports ----------
-
-  function fmtTime(iso: string): string {
-    return new Date(iso).toLocaleString();
-  }
-
-  function importRowHTML({ imp, progress }: ImportRow): string {
-    const totalPages = imp.total_pages;
-    const extractedOf = progress.totalUnits != null ? `${progress.completedUnits} / ${progress.totalUnits}` : '—';
-    return `
-      <div class="import-list-row">
-        <div class="import-list-row-h">
-          <span class="import-list-title">${esc(imp.title)}</span>
-          <span class="page-status-badge ${esc(imp.status)}">${esc(imp.status.replace(/_/g, ' '))}</span>
-        </div>
-        <div class="import-list-meta">
-          <span>Created ${fmtTime(imp.created_at)}</span>
-          <span>${progress.percent}%</span>
-          <span>${imp.pages_prepared} / ${totalPages ?? '?'} pages prepared</span>
-          <span>${extractedOf} extracted</span>
-          ${progress.failedUnits > 0 ? `<span class="import-list-warn">${progress.failedUnits} failed</span>` : ''}
-          ${progress.reviewCounts?.needsReview ? `<span>${progress.reviewCounts.needsReview} need review</span>` : ''}
-          <span>Updated ${fmtTime(imp.updated_at)}</span>
-        </div>
-        <button class="btn-sec" data-open-import="${esc(imp.id)}">Open import</button>
-      </div>`;
-  }
-
-  function renderImportsSection(): void {
-    const el = document.getElementById('importsSection');
-    if (!el || !deck) return;
-    if (importRows === null) {
-      el.innerHTML = `<div class="panelbox"><p class="p-text">Loading imports…</p></div>`;
-      return;
-    }
-    if (!importRows.length) {
-      el.innerHTML = '';
-      return;
-    }
-    el.innerHTML = `
-      <div class="panelbox">
-        <h3>Document imports</h3>
-        <div class="import-list">${importRows.map(importRowHTML).join('')}</div>
-      </div>`;
-    el.querySelectorAll<HTMLButtonElement>('[data-open-import]').forEach((btn) => {
-      btn.addEventListener('click', () => deps.onOpenImport(deck!.id, deck!.name, btn.dataset.openImport!));
-    });
-  }
-
-  // ---------- tag filter ----------
-
-  async function renderTagFilterSection(): Promise<void> {
-    if (!deck) return;
-    let el = document.getElementById('tagFilterSection');
-    if (!el) return;
-    if (!deckTags) {
-      el.innerHTML = `<div class="stats-loading">Loading tags…</div>`;
-      try {
-        deckTags = await fetchDeckTags(deck.id);
-      } catch (e) {
-        el = document.getElementById('tagFilterSection'); // may have been re-rendered while awaiting
-        if (el) el.innerHTML = `<div class="panelbox">Couldn't load tags: ${esc(errMsg(e))}</div>`;
-        return;
-      }
-    }
-    el = document.getElementById('tagFilterSection');
-    if (!el) return;
-    if (!deckTags.length) {
-      el.innerHTML = `<div class="panelbox"><p style="font-size:13px;color:var(--ink-faint)">No tags on this deck's cards yet.</p></div>`;
-      return;
-    }
-    el.innerHTML = `
-      <div class="panelbox">
-        <h3>Filter by tag <span style="font-weight:400;color:var(--ink-faint);font-size:12.5px">(matches any tag selected)</span></h3>
-        <div class="tagbar">
-          ${deckTags
-            .map(
-              (t) =>
-                `<button class="${tagFilter.includes(t.tag) ? 'on' : ''}" data-tag="${esc(t.tag)}">${esc(t.tag)} <span style="opacity:.6">${t.count}</span></button>`,
-            )
-            .join('')}
-        </div>
-        ${tagFilter.length ? `<button class="btn-sec" id="clearTagFilterBtn">Clear filter (${tagFilter.length})</button>` : ''}
-      </div>
-    `;
-    el.querySelectorAll<HTMLElement>('.tagbar button[data-tag]').forEach((btn) => {
-      btn.addEventListener('click', () => toggleTagFilter(btn.dataset.tag!));
-    });
-    document.getElementById('clearTagFilterBtn')?.addEventListener('click', () => {
-      tagFilter = [];
-      render();
-    });
-  }
-
-  function toggleTagFilter(tag: string): void {
-    const i = tagFilter.indexOf(tag);
-    if (i >= 0) tagFilter.splice(i, 1);
-    else tagFilter.push(tag);
-    render();
-  }
-
   // ---------- stats ----------
 
   function statsHTML(data: DeckStatsWithStreak): string {
     return `
       <div class="panelbox">
-        <h3>This deck's stats</h3>
+        <h3>📊 This deck's stats</h3>
         <div class="stat-grid">
           <div class="stat-item"><div class="stat-v">${data.reviews.today}</div><div class="stat-k">reviewed today</div></div>
           <div class="stat-item"><div class="stat-v">${accuracyPct(data.ratingsToday)}%</div><div class="stat-k">accuracy today</div></div>

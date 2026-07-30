@@ -25,6 +25,9 @@ import type {
   AnswerKeyStatus,
   CardCategorizeContent,
   CardChoiceContent,
+  CardFlashcardContent,
+  CardFlashcardDetail,
+  CardFlashcardExample,
   CardGrammarRuleContent,
   CardMatchingContent,
   CardOpenTaskContent,
@@ -37,11 +40,22 @@ import type {
   PageBlock,
   RichTextContent,
 } from '../types';
-import { esc, toast } from './dom';
+import { esc, errMsg, toast } from './dom';
 import { getImportAudioUrl } from './imports';
 import { resolveReadModeComponentType } from './legacyComponentMap';
 import { renderComposedActivity } from './composedActivity';
 import { renderRichText, renderRichTextPronounced, renderTextWithPronunciation } from './richText';
+import { getSpokenAudioUrl } from './tts';
+
+/** A pre-v13 card may still have a bare French string in detail.examples instead of an { fr, en } pair — never migrated in place, so both shapes are handled at render time. */
+function normalizeExample(ex: CardFlashcardExample | string): { fr: string; en: string | null } {
+  return typeof ex === 'string' ? { fr: ex, en: null } : { fr: ex.fr, en: ex.en ?? null };
+}
+
+/** Exported so flashcard front-face markup outside this file (session.ts/studyMode.ts) can render the same 🔊 icon — wire it via wirePronunciationIcons, also exported below. The emoji and the spinner both always exist in the DOM; CSS (.pron-icon.pron-loading) swaps which one is visible, so there's no re-render/content-swap race with playPronunciation's own state changes. */
+export function pronIconHTML(text: string): string {
+  return `<button type="button" class="pron-icon" data-pron-play data-pron-text="${esc(text)}" title="Play pronunciation"><span class="pron-icon-emoji">🔊</span><span class="pron-icon-spinner"></span></button>`;
+}
 
 function c<T>(block: PageBlock): T {
   return block.content as T;
@@ -83,11 +97,11 @@ function isTitleRedundant(block: PageBlock, recipe: string): boolean {
       return normalizeForDedup(bodyText) === titleNorm;
     }
   }
-  if (block.kind === 'image_ref') {
+  if (block.block_kind === 'image_ref') {
     const caption = (block.content as { caption?: string })?.caption;
     return !!caption && normalizeForDedup(caption) === titleNorm;
   }
-  if (block.kind === 'audio_ref') {
+  if (block.block_kind === 'audio_ref') {
     const label = (block.content as { label?: string })?.label;
     return !!label && normalizeForDedup(label) === titleNorm;
   }
@@ -165,7 +179,7 @@ function renderCardInstruction(block: PageBlock, suppress: boolean): string {
 
 /** Visual-only "Verify" provisioning (spec section 8) — no grading logic. Status drives whether the button is enabled, never whether an answer is checked. */
 function renderVerifyArea(block: PageBlock): string {
-  if (block.kind !== 'interaction') return '';
+  if (block.block_kind !== 'interaction') return '';
   const status: AnswerKeyStatus = block.answer_key_status ?? 'unknown';
   const cfg: Record<AnswerKeyStatus, { label: string; disabled: boolean; note: string }> = {
     available: { label: 'Verify', disabled: false, note: '' },
@@ -189,12 +203,27 @@ function renderTranslationToggle(block: PageBlock): string {
   </div>`;
 }
 
+// vocabulary/table/flashcard already render their own precise, per-term/
+// per-example pron-icons inline (see their body renderers) — a second,
+// generic whole-card icon here would be redundant for those specifically.
+// Every other recipe with real French content gets this one, so "can I
+// hear this" stops depending on which recipe a card happens to use.
+const RECIPES_WITH_OWN_PRON_ICONS = new Set(['vocabulary', 'table', 'flashcard']);
+
+function renderPronArea(block: PageBlock, recipe: string): string {
+  if (!block.pronunciation_enabled || RECIPES_WITH_OWN_PRON_ICONS.has(recipe)) return '';
+  const text = getPrimaryBodyText(block, recipe);
+  if (!text) return '';
+  return `<div class="read-pron-area">${pronIconHTML(text)}<span class="read-pron-label">Play pronunciation</span></div>`;
+}
+
 function renderCard(block: PageBlock, bodyHtml: string, showNumBadge: boolean, recipe: string): string {
   const categoryAttr = block.category ? ` data-category="${esc(block.category)}"` : '';
-  return `<div class="read-card" data-kind="${esc(block.kind)}"${categoryAttr}>
+  return `<div class="read-card" data-kind="${esc(block.block_kind ?? '')}"${categoryAttr}>
     ${renderCardHeader(block, showNumBadge, isTitleRedundant(block, recipe))}
     ${renderCardInstruction(block, isInstructionRedundant(block, recipe))}
     <div class="read-card-body">${bodyHtml}</div>
+    ${renderPronArea(block, recipe)}
     ${renderTranslationToggle(block)}
     ${renderVerifyArea(block)}
   </div>`;
@@ -255,8 +284,8 @@ function renderAdjunctTable(table: string[][] | undefined): string {
 
 function textBody(block: PageBlock): string {
   const content = block.content as CardTextContent;
-  const style = content.style ?? legacyTextStyle(block.component_type);
-  const pron = block.pronunciation_enabled;
+  const style = content.style ?? legacyTextStyle(block.component_type ?? '');
+  const pron = block.pronunciation_enabled ?? false;
 
   let bodyHtml: string;
   if (Array.isArray(content.nodes) && content.nodes.length) {
@@ -292,6 +321,81 @@ function vocabularyBody(block: PageBlock): string {
   return `${title ? `<div class="read-vocab-title">${esc(title)}</div>` : ''}<div class="read-vocab-group">${rows}</div>`;
 }
 
+// ---------- 'flashcard' recipe: a real recall card — Read Mode shows both faces at once (nothing to hide here, unlike Practice/Study) ----------
+
+const FLASHCARD_DETAIL_LABELS: Record<string, string> = {
+  ipa: 'IPA',
+  register: 'Register',
+  rule: 'Rule',
+  wiktionary: 'Wiktionary',
+  note: 'Note',
+  tip: 'Tip',
+};
+
+/**
+ * The flashcard back's rich-detail section, shared between Read Mode's
+ * always-both-shown flashcardBody and Practice/Study's back face (session.ts
+ * /studyMode.ts) — a card's back is the whole point of "detail", so it's
+ * shown directly, never gated behind a further click. Examples come first
+ * (the single most valuable field) as styled quote-like lines, then the
+ * rest as a compact labeled panel, then a table if present.
+ */
+export function renderFlashcardDetailHTML(detail: CardFlashcardDetail | null | undefined): string {
+  const d = detail ?? {};
+  const detailKeys = Object.keys(FLASHCARD_DETAIL_LABELS) as ('ipa' | 'register' | 'rule' | 'wiktionary' | 'note' | 'tip')[];
+  const rows = detailKeys
+    .filter((key) => key !== 'ipa' && d[key])
+    .map((key) => `<div class="pf-detail-row"><span class="pf-detail-label">${esc(FLASHCARD_DETAIL_LABELS[key])}</span><span class="pf-detail-value">${esc(d[key]!)}</span></div>`)
+    .join('');
+  const examplesHtml = d.examples?.length
+    ? `<div class="pf-examples">${d.examples
+        .map((ex) => {
+          const { fr, en } = normalizeExample(ex);
+          return `<div class="pf-example">
+            <div class="pf-example-fr">${esc(fr)}${pronIconHTML(fr)}</div>
+            ${en ? `<div class="pf-example-en">${esc(en)}</div>` : ''}
+          </div>`;
+        })
+        .join('')}</div>`
+    : '';
+  const tableHtml = d.table?.length ? `<table class="pf-table">${d.table.map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`).join('')}</table>` : '';
+  if (!examplesHtml && !rows && !tableHtml) return '';
+  return `<div class="pf-detail">${examplesHtml}${rows ? `<div class="pf-detail-grid">${rows}</div>` : ''}${tableHtml}</div>`;
+}
+
+function flashcardBody(block: PageBlock): string {
+  const { front, back, detail } = c<CardFlashcardContent>(block);
+  const d = detail ?? {};
+  const detailKeys = Object.keys(FLASHCARD_DETAIL_LABELS) as ('ipa' | 'register' | 'rule' | 'wiktionary' | 'note' | 'tip')[];
+  const detailRows = detailKeys
+    .map((key) => {
+      const value = d[key];
+      if (!value) return '';
+      return `<div class="read-flashcard-detail-row"><span class="read-flashcard-detail-label">${esc(FLASHCARD_DETAIL_LABELS[key])}</span><span>${esc(value)}</span></div>`;
+    })
+    .join('');
+  const examplesHtml = d.examples?.length
+    ? `<div class="read-flashcard-examples">${d.examples
+        .map((ex) => {
+          const { fr, en } = normalizeExample(ex);
+          return `<div class="read-flashcard-example">
+            <div class="read-flashcard-example-fr">${esc(fr)}${pronIconHTML(fr)}</div>
+            ${en ? `<div class="read-flashcard-example-en">${esc(en)}</div>` : ''}
+          </div>`;
+        })
+        .join('')}</div>`
+    : '';
+  const tableHtml = d.table?.length ? `<table class="p-tbl">${d.table.map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`).join('')}</table>` : '';
+  return `
+    <div class="read-flashcard">
+      <div class="read-flashcard-front">${esc(front)}${pronIconHTML(front)}</div>
+      <div class="read-flashcard-back">${esc(back)}</div>
+    </div>
+    ${examplesHtml}
+    ${detailRows ? `<div class="read-flashcard-detail">${detailRows}</div>` : ''}
+    ${tableHtml}`;
+}
+
 // ---------- 'grammar_rule' recipe: one rule + examples, purpose-built (not a generic paragraph) ----------
 
 function grammarRuleBody(block: PageBlock): string {
@@ -321,8 +425,8 @@ function tableBody(block: PageBlock): string {
 
 function dialogueBody(block: PageBlock): string {
   const { turns } = c<{ turns: { speaker: string | null; text?: string; template?: string }[] }>(block);
-  const pron = block.pronunciation_enabled;
-  const isInteraction = block.kind === 'interaction';
+  const pron = block.pronunciation_enabled ?? false;
+  const isInteraction = block.block_kind === 'interaction';
   return `<div class="chat-card">${(turns ?? [])
     .map((t, i) => {
       const text = t.text ?? t.template ?? '';
@@ -345,7 +449,7 @@ function singleChoiceBody(block: PageBlock): string {
   const opts = (options ?? [])
     .map(
       (o, i) =>
-        `<button type="button" class="read-choice-opt" role="radio" aria-checked="false" data-choice-value="${esc(o)}" id="${esc(name)}-${i}"><span class="read-choice-mark read-choice-mark-radio"></span><span class="read-choice-label">${esc(o)}</span></button>`,
+        `<button type="button" class="read-choice-opt" role="radio" aria-checked="false" data-choice-value="${esc(o)}" data-idx="${i}" id="${esc(name)}-${i}"><span class="read-choice-mark read-choice-mark-radio"></span><span class="read-choice-label">${esc(o)}</span></button>`,
     )
     .join('');
   return `${prompt ? `<div class="book-prompt">${esc(prompt)}</div>` : ''}<div class="read-choice-list" data-choice-single="${esc(block.id)}">${opts}</div>`;
@@ -357,7 +461,7 @@ function multiSelectBody(block: PageBlock): string {
   const opts = (options ?? [])
     .map(
       (o, i) =>
-        `<button type="button" class="read-choice-opt" role="checkbox" aria-checked="false" data-choice-value="${esc(o)}" id="${esc(name)}-${i}"><span class="read-choice-mark read-choice-mark-check"></span><span class="read-choice-label">${esc(o)}</span></button>`,
+        `<button type="button" class="read-choice-opt" role="checkbox" aria-checked="false" data-choice-value="${esc(o)}" data-idx="${i}" id="${esc(name)}-${i}"><span class="read-choice-mark read-choice-mark-check"></span><span class="read-choice-label">${esc(o)}</span></button>`,
     )
     .join('');
   return `${prompt ? `<div class="book-prompt">${esc(prompt)}</div>` : ''}<div class="read-choice-list" data-choice-multi="${esc(block.id)}">${opts}</div>`;
@@ -390,7 +494,7 @@ function textInputBody(block: PageBlock): string {
       .join('');
     return `${promptHtml}<div class="read-mte-fields">${rows}</div>`;
   }
-  const isLong = content.long === true || isLegacyLongForm(block.component_type);
+  const isLong = content.long === true || isLegacyLongForm(block.component_type ?? '');
   if (isLong) {
     return `${promptHtml}${noteHtml}<textarea class="read-long-writing" rows="6" data-long-writing="${esc(block.id)}" placeholder="${esc(content.placeholder ?? 'Écrivez votre réponse ici…')}"></textarea>`;
   }
@@ -496,6 +600,7 @@ function audioRefBody(block: PageBlock, audioFilesById: Map<string, ImportAudioF
 const DOCUMENT_BODY_RENDERERS: Record<string, (b: PageBlock) => string> = {
   text: textBody,
   vocabulary: vocabularyBody,
+  flashcard: flashcardBody,
   grammar_rule: grammarRuleBody,
   table: tableBody,
   dialogue: dialogueBody,
@@ -522,11 +627,11 @@ const INTERACTION_BODY_RENDERERS: Record<string, (b: PageBlock) => string> = {
  * sub-question cards) — see renderCardHeader.
  */
 export function renderReadModeBlock(block: PageBlock, audioFilesById: Map<string, ImportAudioFile>, showNumBadge = true): string {
-  if (block.kind === 'image_ref') return renderCard(block, imageRefBody(block), showNumBadge, 'image_ref');
-  if (block.kind === 'audio_ref') return renderCard(block, audioRefBody(block, audioFilesById), showNumBadge, 'audio_ref');
+  if (block.block_kind === 'image_ref') return renderCard(block, imageRefBody(block), showNumBadge, 'image_ref');
+  if (block.block_kind === 'audio_ref') return renderCard(block, audioRefBody(block, audioFilesById), showNumBadge, 'audio_ref');
 
-  const recipe = resolveReadModeComponentType(block.kind, block.component_type, (block.content ?? {}) as Record<string, unknown>);
-  const renderer = block.kind === 'interaction' ? INTERACTION_BODY_RENDERERS[recipe] : DOCUMENT_BODY_RENDERERS[recipe];
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  const renderer = block.block_kind === 'interaction' ? INTERACTION_BODY_RENDERERS[recipe] : DOCUMENT_BODY_RENDERERS[recipe];
 
   let bodyHtml: string;
   try {
@@ -540,13 +645,33 @@ export function renderReadModeBlock(block: PageBlock, audioFilesById: Map<string
 
 // ---------- wiring (interactivity + purely-visual affordances) ----------
 
-function wirePronunciationIcons(container: ParentNode): void {
+let currentPronAudio: HTMLAudioElement | null = null;
+
+async function playPronunciation(btn: HTMLButtonElement): Promise<void> {
+  const text = btn.dataset.pronText;
+  if (!text || btn.classList.contains('pron-loading')) return;
+  currentPronAudio?.pause();
+  document.querySelectorAll('.pron-icon.pron-playing').forEach((el) => el.classList.remove('pron-playing'));
+  btn.classList.add('pron-loading');
+  try {
+    const url = await getSpokenAudioUrl(text);
+    btn.classList.remove('pron-loading');
+    const audio = new Audio(url);
+    currentPronAudio = audio;
+    btn.classList.add('pron-playing');
+    audio.addEventListener('ended', () => btn.classList.remove('pron-playing'));
+    audio.addEventListener('pause', () => btn.classList.remove('pron-playing'));
+    await audio.play();
+  } catch (e) {
+    btn.classList.remove('pron-loading', 'pron-playing');
+    toast('Could not play pronunciation: ' + errMsg(e));
+  }
+}
+
+/** Wires every 🔊 icon within `container` to real on-demand pronunciation audio (see lib/tts.ts) — exported so flashcard face markup outside the read-mode-block system (session.ts/studyMode.ts's own front/back HTML) can wire its own pron-icons the same way. */
+export function wirePronunciationIcons(container: ParentNode): void {
   container.querySelectorAll<HTMLButtonElement>('[data-pron-play]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      btn.classList.add('pron-playing');
-      toast('Pronunciation playback preview — audio not yet available.');
-      setTimeout(() => btn.classList.remove('pron-playing'), 400);
-    });
+    btn.addEventListener('click', () => void playPronunciation(btn));
   });
 }
 
@@ -563,13 +688,444 @@ function wireTranslationToggles(container: ParentNode): void {
   });
 }
 
-function wireVerifyButtons(container: ParentNode): void {
+// ---------- real answer-checking (Verify), using answer fields populated from an attached answer key ----------
+
+export interface VerifyOutcome {
+  correct: boolean;
+  summary: string;
+}
+
+function normalizeAnswer(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function markVerify(el: Element | null, correct: boolean): void {
+  el?.classList.remove('read-verify-correct', 'read-verify-incorrect');
+  el?.classList.add(correct ? 'read-verify-correct' : 'read-verify-incorrect');
+}
+
+function verifySingleChoice(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { correctOptions } = c<CardChoiceContent>(block);
+  if (!correctOptions?.length) return null;
+  const root = container.querySelector<HTMLElement>(`[data-choice-single="${block.id}"]`);
+  if (!root) return null;
+  const correctSet = new Set(correctOptions);
+  let anySelected = false;
+  let correct = true;
+  root.querySelectorAll<HTMLButtonElement>('.read-choice-opt').forEach((btn) => {
+    const idx = Number(btn.dataset.idx);
+    const selected = btn.getAttribute('aria-checked') === 'true';
+    const shouldBeSelected = correctSet.has(idx);
+    if (selected) anySelected = true;
+    btn.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    if (selected !== shouldBeSelected) correct = false;
+    // Always reveal the correct option (green), and flag a wrongly-picked one (red) — never mark a merely-unselected-and-correctly-so option at all.
+    if (selected || shouldBeSelected) markVerify(btn, shouldBeSelected);
+  });
+  if (!anySelected) return { correct: false, summary: 'Pick an answer first.' };
+  return { correct, summary: correct ? 'Correct!' : 'Not quite — the correct answer is highlighted.' };
+}
+
+function verifyMultiSelect(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { correctOptions } = c<CardChoiceContent>(block);
+  if (!correctOptions?.length) return null;
+  const root = container.querySelector<HTMLElement>(`[data-choice-multi="${block.id}"]`);
+  if (!root) return null;
+  const correctSet = new Set(correctOptions);
+  let anySelected = false;
+  let allMatch = true;
+  root.querySelectorAll<HTMLButtonElement>('.read-choice-opt').forEach((btn) => {
+    const idx = Number(btn.dataset.idx);
+    const selected = btn.getAttribute('aria-checked') === 'true';
+    const shouldBeSelected = correctSet.has(idx);
+    if (selected) anySelected = true;
+    btn.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    if (selected !== shouldBeSelected) allMatch = false;
+    if (selected || shouldBeSelected) markVerify(btn, selected === shouldBeSelected);
+  });
+  if (!anySelected) return { correct: false, summary: 'Pick at least one answer first.' };
+  return { correct: allMatch, summary: allMatch ? 'Correct!' : 'Not quite — correct options are highlighted.' };
+}
+
+function verifyMatchingPairs(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { correctPairs } = c<CardMatchingContent>(block);
+  if (!correctPairs?.length) return null;
+  const root = container.querySelector<HTMLElement>(`[data-match-root="${block.id}"]`);
+  if (!root) return null;
+  const leftButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('.read-match-item[data-side="left"]'));
+  const rightByKey = new Map<string, HTMLButtonElement>();
+  root.querySelectorAll<HTMLButtonElement>('.read-match-item[data-side="right"]').forEach((b) => {
+    if (b.dataset.pairKey) rightByKey.set(b.dataset.pairKey, b);
+  });
+  const correctSet = new Set(correctPairs.map(([l, r]) => `${l}-${r}`));
+
+  let madeAnyPair = false;
+  let allCorrect = true;
+  leftButtons.forEach((lb) => {
+    lb.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    if (!lb.classList.contains('paired') || !lb.dataset.pairKey) return;
+    madeAnyPair = true;
+    const rb = lb.dataset.pairKey ? rightByKey.get(lb.dataset.pairKey) : undefined;
+    rb?.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    const li = Number(lb.dataset.idx);
+    const ri = rb ? Number(rb.dataset.idx) : -1;
+    const isCorrect = correctSet.has(`${li}-${ri}`);
+    if (!isCorrect) allCorrect = false;
+    markVerify(lb, isCorrect);
+    if (rb) markVerify(rb, isCorrect);
+  });
+  if (!madeAnyPair) return { correct: false, summary: 'Match some pairs first.' };
+  const complete = leftButtons.every((lb) => lb.classList.contains('paired'));
+  const correct = allCorrect && complete;
+  return { correct, summary: correct ? 'Correct!' : 'Not quite — mismatched pairs are highlighted.' };
+}
+
+function verifyOrdering(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { correctOrder, items } = c<CardOrderingContent>(block);
+  if (!correctOrder?.length || !items?.length) return null;
+  let allFilled = true;
+  let allCorrect = true;
+  items.forEach((_, i) => {
+    const sel = container.querySelector<HTMLSelectElement>(`[data-order-select="${block.id}-${i}"]`);
+    if (!sel) return;
+    sel.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    if (!sel.value) {
+      allFilled = false;
+      return;
+    }
+    const expectedPosition = correctOrder.indexOf(i) + 1;
+    const isCorrect = Number(sel.value) === expectedPosition;
+    if (!isCorrect) allCorrect = false;
+    markVerify(sel, isCorrect);
+  });
+  if (!allFilled) return { correct: false, summary: 'Order every item first.' };
+  return { correct: allCorrect, summary: allCorrect ? 'Correct!' : 'Not quite — mismatched positions are highlighted.' };
+}
+
+function verifyCategorize(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { correctGroups, items } = c<CardCategorizeContent>(block);
+  if (!correctGroups?.length || !items?.length) return null;
+  let allAssigned = true;
+  let allCorrect = true;
+  items.forEach((_, i) => {
+    const el = container.querySelector<HTMLButtonElement>(`[data-cat-item="${block.id}-${i}"]`);
+    if (!el) return;
+    el.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    if (!el.classList.contains('assigned') || el.dataset.groupIdx === undefined) {
+      allAssigned = false;
+      return;
+    }
+    const isCorrect = Number(el.dataset.groupIdx) === correctGroups[i];
+    if (!isCorrect) allCorrect = false;
+    markVerify(el, isCorrect);
+  });
+  if (!allAssigned) return { correct: false, summary: 'Sort every item first.' };
+  return { correct: allCorrect, summary: allCorrect ? 'Correct!' : 'Not quite — mismatched items are highlighted.' };
+}
+
+function verifyTextInput(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const content = block.content as CardTextInputContent;
+  const answers = content.answers;
+  if (!answers?.length) return null;
+  let inputs: (HTMLInputElement | HTMLTextAreaElement | null)[] = [];
+  if (content.template) {
+    inputs = answers.map((_, i) => container.querySelector<HTMLInputElement>(`[data-blank-input="${block.id}-${i}"]`));
+  } else if (content.fields?.length) {
+    inputs = content.fields.map((f) => container.querySelector<HTMLInputElement>(`[data-mte-field="${block.id}-${f.id}"]`));
+  } else {
+    inputs = [container.querySelector<HTMLInputElement>(`[data-text-entry="${block.id}"]`)];
+  }
+  if (!inputs.some((el) => el)) return null;
+
+  let allFilled = true;
+  let allCorrect = true;
+  inputs.forEach((input, i) => {
+    if (!input) return;
+    input.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    const val = input.value.trim();
+    const expected = answers[i];
+    if (!val) {
+      allFilled = false;
+      return;
+    }
+    const isCorrect = expected != null && normalizeAnswer(val) === normalizeAnswer(expected);
+    if (!isCorrect) allCorrect = false;
+    markVerify(input, isCorrect);
+  });
+  if (!allFilled) return { correct: false, summary: 'Fill in every blank first.' };
+  return { correct: allCorrect, summary: allCorrect ? 'Correct!' : 'Not quite — incorrect answers are highlighted.' };
+}
+
+function verifyDialogue(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const { turns } = c<{ turns: { answer?: string | null }[] }>(block);
+  const answerable = (turns ?? []).map((t, i) => ({ i, answer: t.answer })).filter((t): t is { i: number; answer: string } => t.answer != null);
+  if (!answerable.length) return null;
+
+  let allFilled = true;
+  let allCorrect = true;
+  let anyInput = false;
+  for (const { i, answer } of answerable) {
+    const input = container.querySelector<HTMLInputElement>(`[data-blank-input="${block.id}-${i}-0"]`);
+    if (!input) continue;
+    anyInput = true;
+    input.classList.remove('read-verify-correct', 'read-verify-incorrect');
+    const val = input.value.trim();
+    if (!val) {
+      allFilled = false;
+      continue;
+    }
+    const isCorrect = normalizeAnswer(val) === normalizeAnswer(answer);
+    if (!isCorrect) allCorrect = false;
+    markVerify(input, isCorrect);
+  }
+  if (!anyInput) return null;
+  if (!allFilled) return { correct: false, summary: 'Fill in every blank first.' };
+  return { correct: allCorrect, summary: allCorrect ? 'Correct!' : 'Not quite — incorrect answers are highlighted.' };
+}
+
+// ---------- capturing/restoring the learner's in-progress answer (Study mode persistence) ----------
+// Deliberately separate from the verify* functions above: those check a
+// live attempt against a known-correct answer; these just read/write
+// whatever's currently in the widget, correct or not, so Study mode can
+// survive a re-render (or a reload) without silently discarding it.
+
+type CapturedState = Record<string, unknown>;
+
+function captureChoiceState(block: PageBlock, container: ParentNode, multi: boolean): CapturedState | null {
+  const root = container.querySelector<HTMLElement>(`[data-choice-${multi ? 'multi' : 'single'}="${block.id}"]`);
+  if (!root) return null;
+  const selected: number[] = [];
+  root.querySelectorAll<HTMLButtonElement>('.read-choice-opt').forEach((btn) => {
+    if (btn.getAttribute('aria-checked') === 'true') selected.push(Number(btn.dataset.idx));
+  });
+  return selected.length ? { selected } : null;
+}
+
+function applyChoiceState(block: PageBlock, container: ParentNode, multi: boolean, state: CapturedState): void {
+  const root = container.querySelector<HTMLElement>(`[data-choice-${multi ? 'multi' : 'single'}="${block.id}"]`);
+  const selected = state.selected;
+  if (!root || !Array.isArray(selected)) return;
+  const selectedSet = new Set(selected as number[]);
+  root.querySelectorAll<HTMLButtonElement>('.read-choice-opt').forEach((btn) => {
+    const sel = selectedSet.has(Number(btn.dataset.idx));
+    btn.setAttribute('aria-checked', String(sel));
+    btn.classList.toggle('selected', sel);
+  });
+}
+
+/** Covers text_input's template/fields/single/long shapes AND an interactive dialogue's inline blanks — every one of these uses the same data-blank-input/-mte-field/-text-entry/-long-writing attributes as their identifying key, so one capture/apply pair works for both recipes. */
+function captureTextInputState(block: PageBlock, container: ParentNode): CapturedState | null {
+  const values: Record<string, string> = {};
+  container.querySelectorAll<HTMLInputElement>(`[data-blank-input^="${block.id}-"]`).forEach((el) => {
+    values[`blank:${el.dataset.blankInput}`] = el.value;
+  });
+  container.querySelectorAll<HTMLInputElement>(`[data-mte-field^="${block.id}-"]`).forEach((el) => {
+    values[`mte:${el.dataset.mteField}`] = el.value;
+  });
+  const single = container.querySelector<HTMLInputElement>(`[data-text-entry="${block.id}"]`);
+  if (single) values['entry'] = single.value;
+  const long = container.querySelector<HTMLTextAreaElement>(`[data-long-writing="${block.id}"]`);
+  if (long) values['long'] = long.value;
+  return Object.values(values).some((v) => v.trim()) ? { values } : null;
+}
+
+function applyTextInputState(block: PageBlock, container: ParentNode, state: CapturedState): void {
+  const values = state.values as Record<string, string> | undefined;
+  if (!values) return;
+  container.querySelectorAll<HTMLInputElement>(`[data-blank-input^="${block.id}-"]`).forEach((el) => {
+    const v = values[`blank:${el.dataset.blankInput}`];
+    if (v != null) el.value = v;
+  });
+  container.querySelectorAll<HTMLInputElement>(`[data-mte-field^="${block.id}-"]`).forEach((el) => {
+    const v = values[`mte:${el.dataset.mteField}`];
+    if (v != null) el.value = v;
+  });
+  const single = container.querySelector<HTMLInputElement>(`[data-text-entry="${block.id}"]`);
+  if (single && values['entry'] != null) single.value = values['entry'];
+  const long = container.querySelector<HTMLTextAreaElement>(`[data-long-writing="${block.id}"]`);
+  if (long && values['long'] != null) long.value = values['long'];
+}
+
+function captureMatchingState(block: PageBlock, container: ParentNode): CapturedState | null {
+  const root = container.querySelector<HTMLElement>(`[data-match-root="${block.id}"]`);
+  if (!root) return null;
+  const pairs: [number, number][] = [];
+  const seenKeys = new Set<string>();
+  root.querySelectorAll<HTMLButtonElement>('.read-match-item[data-side="left"].paired').forEach((lb) => {
+    const key = lb.dataset.pairKey;
+    if (!key || seenKeys.has(key)) return;
+    seenKeys.add(key);
+    const rb = root.querySelector<HTMLButtonElement>(`.read-match-item[data-side="right"][data-pair-key="${key}"]`);
+    if (rb) pairs.push([Number(lb.dataset.idx), Number(rb.dataset.idx)]);
+  });
+  return pairs.length ? { pairs } : null;
+}
+
+/** Restores saved pairs directly (bypassing the click-to-pair wiring's own color/pending bookkeeping) — a freshly-added pair after a restore may reuse a color already used by a restored pair; a harmless cosmetic overlap, never a correctness issue. */
+function applyMatchingState(block: PageBlock, container: ParentNode, state: CapturedState): void {
+  const pairs = state.pairs as [number, number][] | undefined;
+  if (!pairs?.length) return;
+  const root = container.querySelector<HTMLElement>(`[data-match-root="${block.id}"]`);
+  if (!root) return;
+  pairs.forEach(([li, ri], i) => {
+    const lb = root.querySelector<HTMLButtonElement>(`.read-match-item[data-side="left"][data-idx="${li}"]`);
+    const rb = root.querySelector<HTMLButtonElement>(`.read-match-item[data-side="right"][data-idx="${ri}"]`);
+    if (!lb || !rb) return;
+    const colorIdx = i % MATCH_COLOR_COUNT;
+    const pairKey = `${block.id}-${li}-${ri}-${colorIdx}`;
+    lb.dataset.pairKey = pairKey;
+    rb.dataset.pairKey = pairKey;
+    lb.classList.add('paired', `match-pair-${colorIdx}`);
+    rb.classList.add('paired', `match-pair-${colorIdx}`);
+  });
+}
+
+function captureOrderingState(block: PageBlock, container: ParentNode): CapturedState | null {
+  const values: Record<string, string> = {};
+  container.querySelectorAll<HTMLSelectElement>(`[data-order-select^="${block.id}-"]`).forEach((el) => {
+    if (el.dataset.orderSelect) values[el.dataset.orderSelect] = el.value;
+  });
+  return Object.values(values).some((v) => v) ? { values } : null;
+}
+
+function applyOrderingState(block: PageBlock, container: ParentNode, state: CapturedState): void {
+  const values = state.values as Record<string, string> | undefined;
+  if (!values) return;
+  container.querySelectorAll<HTMLSelectElement>(`[data-order-select^="${block.id}-"]`).forEach((el) => {
+    const v = el.dataset.orderSelect ? values[el.dataset.orderSelect] : undefined;
+    if (v) el.value = v;
+  });
+}
+
+function captureCategorizeState(block: PageBlock, container: ParentNode): CapturedState | null {
+  const root = container.querySelector<HTMLElement>(`[data-cat-root="${block.id}"]`);
+  if (!root) return null;
+  const assignments: Record<string, number> = {};
+  root.querySelectorAll<HTMLButtonElement>('.read-cat-item.assigned').forEach((el) => {
+    if (el.dataset.catItem && el.dataset.groupIdx !== undefined) assignments[el.dataset.catItem] = Number(el.dataset.groupIdx);
+  });
+  return Object.keys(assignments).length ? { assignments } : null;
+}
+
+/** Moves each restored item into its saved group directly (same DOM move wireCategorizeBlock's click handler does), so a later "Clear all"/re-assign click works exactly as if the learner had just placed it there. */
+function applyCategorizeState(block: PageBlock, container: ParentNode, state: CapturedState): void {
+  const assignments = state.assignments as Record<string, number> | undefined;
+  if (!assignments) return;
+  const root = container.querySelector<HTMLElement>(`[data-cat-root="${block.id}"]`);
+  if (!root) return;
+  Object.entries(assignments).forEach(([key, groupIdx]) => {
+    const item = root.querySelector<HTMLButtonElement>(`[data-cat-item="${key}"]`);
+    const itemsContainer = root.querySelector<HTMLElement>(`[data-cat-group-items="${block.id}-${groupIdx}"]`);
+    if (!item || !itemsContainer) return;
+    item.classList.add('assigned', `match-pair-${groupIdx % MATCH_COLOR_COUNT}`);
+    item.dataset.groupIdx = String(groupIdx);
+    itemsContainer.appendChild(item);
+  });
+}
+
+/** Reads whatever's currently in an interactive card's widget — correct or not — for Study mode to persist. Null for a recipe with nothing to capture (speaking/listening/freeform/document recipes) or when nothing's been entered. */
+export function captureAnswerState(block: PageBlock, container: ParentNode): CapturedState | null {
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  switch (recipe) {
+    case 'single_choice':
+      return captureChoiceState(block, container, false);
+    case 'multi_select':
+      return captureChoiceState(block, container, true);
+    case 'matching_pairs':
+      return captureMatchingState(block, container);
+    case 'ordering':
+      return captureOrderingState(block, container);
+    case 'categorize':
+      return captureCategorizeState(block, container);
+    case 'text_input':
+    case 'dialogue':
+      return captureTextInputState(block, container);
+    default:
+      return null;
+  }
+}
+
+/** The inverse of captureAnswerState — call right after wireReadModeBlock, before wiring answer-capture, so a restored pick/pair/value is in place before any further interaction. */
+export function applyAnswerState(block: PageBlock, container: ParentNode, state: CapturedState | null | undefined): void {
+  if (!state) return;
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  switch (recipe) {
+    case 'single_choice':
+      applyChoiceState(block, container, false, state);
+      break;
+    case 'multi_select':
+      applyChoiceState(block, container, true, state);
+      break;
+    case 'matching_pairs':
+      applyMatchingState(block, container, state);
+      break;
+    case 'ordering':
+      applyOrderingState(block, container, state);
+      break;
+    case 'categorize':
+      applyCategorizeState(block, container, state);
+      break;
+    case 'text_input':
+    case 'dialogue':
+      applyTextInputState(block, container, state);
+      break;
+  }
+}
+
+/** Fires `onChange` with the freshly-captured state on any input/click/change bubbling up from this block's widget — one generic delegated listener instead of per-recipe wiring, since captureAnswerState already knows how to read whatever recipe this is. */
+export function wireAnswerCapture(block: PageBlock, container: ParentNode, onChange: (state: CapturedState | null) => void): void {
+  const handler = (): void => onChange(captureAnswerState(block, container));
+  container.addEventListener('input', handler);
+  container.addEventListener('click', handler);
+  container.addEventListener('change', handler);
+}
+
+/**
+ * Runs the same answer-check Verify already uses, exported for Practice/
+ * Study mode's generation-mode flip: flipping a non-flashcard generation-mode
+ * card reveals correct/incorrect right on the same live widget (no re-render,
+ * so the learner's picks aren't lost), then grading appears. Returns null for
+ * a recipe/card with nothing checkable (no answer field populated, or a
+ * recipe like speaking/listening with no answer concept at all) — callers
+ * should still let the learner proceed straight to grading in that case.
+ */
+export function computeVerifyOutcome(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  switch (recipe) {
+    case 'single_choice':
+      return verifySingleChoice(block, container);
+    case 'multi_select':
+      return verifyMultiSelect(block, container);
+    case 'matching_pairs':
+      return verifyMatchingPairs(block, container);
+    case 'ordering':
+      return verifyOrdering(block, container);
+    case 'categorize':
+      return verifyCategorize(block, container);
+    case 'text_input':
+      return verifyTextInput(block, container);
+    case 'dialogue':
+      return verifyDialogue(block, container);
+    default:
+      return null;
+  }
+}
+
+function wireVerifyButtons(block: PageBlock, container: ParentNode): void {
   container.querySelectorAll<HTMLButtonElement>('[data-verify-block]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const area = container.querySelector<HTMLElement>(`[data-feedback-area="${btn.dataset.verifyBlock}"]`);
       if (!area) return;
-      area.hidden = !area.hidden;
-      area.textContent = 'Answer key available — automatic verification is not yet enabled in this preview.';
+      const outcome = computeVerifyOutcome(block, container);
+      area.classList.remove('correct', 'incorrect');
+      if (!outcome) {
+        area.hidden = !area.hidden;
+        area.textContent = 'No checkable answer on this card.';
+        return;
+      }
+      area.hidden = false;
+      area.classList.add(outcome.correct ? 'correct' : 'incorrect');
+      area.textContent = (outcome.correct ? '✓ ' : '✗ ') + outcome.summary;
     });
   });
 }
@@ -734,21 +1290,21 @@ function wireCategorizeBlock(block: PageBlock, container: ParentNode): void {
 /** Attaches interactivity for one rendered Read Mode block — call once per block after inserting its HTML. */
 export function wireReadModeBlock(block: PageBlock, container: ParentNode): void {
   wirePronunciationIcons(container);
-  wireVerifyButtons(container);
+  wireVerifyButtons(block, container);
   wireTranslationToggles(container);
 
-  const recipe = resolveReadModeComponentType(block.kind, block.component_type, (block.content ?? {}) as Record<string, unknown>);
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
 
-  if (block.kind === 'interaction' && (recipe === 'single_choice' || recipe === 'multi_select')) {
+  if (block.block_kind === 'interaction' && (recipe === 'single_choice' || recipe === 'multi_select')) {
     wireChoiceBlock(container);
   }
-  if (block.kind === 'interaction' && recipe === 'matching_pairs') {
+  if (block.block_kind === 'interaction' && recipe === 'matching_pairs') {
     wireMatchingBlock(block, container);
   }
-  if (block.kind === 'interaction' && recipe === 'categorize') {
+  if (block.block_kind === 'interaction' && recipe === 'categorize') {
     wireCategorizeBlock(block, container);
   }
-  if (block.kind === 'audio_ref') {
+  if (block.block_kind === 'audio_ref') {
     const btn = container.querySelector<HTMLButtonElement>(`[data-play-audio-ref="${block.id}"]`);
     const storagePath = container.querySelector<HTMLElement>(`[data-audio-ref-block="${block.id}"]`)?.dataset.storagePath;
     if (btn && storagePath) btn.addEventListener('click', () => void playAudioRef(storagePath, btn));

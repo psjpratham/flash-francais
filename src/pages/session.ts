@@ -2,11 +2,11 @@ import { commitGrade } from '../lib/cards';
 import { fetchDeckStats } from '../lib/decks';
 import { previewAll } from '../lib/fsrs';
 import { playCardAudio } from '../lib/audioPlayer';
-import type { CardWithNote, Deck, DeckStatsWithStreak, NoteFields, Rating } from '../types';
+import type { CardFlashcardContent, CardWithNote, Deck, DeckStatsWithStreak, NoteFields, Rating } from '../types';
 import { $, esc, errMsg, toast } from '../lib/dom';
 import { barRow } from './statsPanel';
 import { PROFILES, type ChipAs, type ProfileChip } from '../lib/profiles';
-import { renderReadModeBlock, wireReadModeBlock } from '../lib/readModeRenderers';
+import { computeVerifyOutcome, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
 import { getRenderedPageUrl } from '../lib/pageRender';
 
 export interface SessionDeps {
@@ -55,11 +55,21 @@ const KEY_GRADE: Record<string, number> = {
 };
 
 /**
- * Study session, sub-slice 3: audio player, session-done screen, sidebar.
- * Returns a cleanup function that must be called when navigating away, to
- * remove the document-level keydown listener.
+ * Practice session, sub-slice 3: audio player, session-done screen, sidebar.
+ * `decks` carries every deck any card in `queue` might belong to — one
+ * entry for a normal per-deck session, several for a global "practice
+ * everything due" session (see loadQueueAcrossAllDecks) — since each card
+ * must be scheduled against its OWN deck's desired_retention, never a
+ * single blended value. Returns a cleanup function that must be called when
+ * navigating away, to remove the document-level keydown listener.
  */
-export function renderSession(container: HTMLElement, deck: Deck, queue: CardWithNote[], deps: SessionDeps): () => void {
+export function renderSession(container: HTMLElement, decks: Map<string, Deck>, queue: CardWithNote[], deps: SessionDeps): () => void {
+  /** The one deck a normal per-deck session belongs to — null for a global, multi-deck session, where there's no single deck to attribute the sidebar/stats to. */
+  const singleDeck = decks.size === 1 ? [...decks.values()][0] : null;
+  function deckFor(card: CardWithNote): Deck {
+    return decks.get(card.deck_id)!;
+  }
+
   let pos = 0;
   let flipped = false;
   let openChipIndex: number | null = null;
@@ -73,15 +83,15 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
   let dragging = false;
   let moved = false;
 
-  // Cards compiled from an imported page_block (see sendPageBlocksToPractice)
-  // carry their source page's rendered_page_path — signed URLs for every
-  // distinct path in this queue are fetched once up front rather than per
-  // card, since createSignedUrl is a network call and the same page image is
-  // typically reused by several cards in a row.
+  // Cards with origin='textbook_extraction' carry their source page's
+  // rendered_page_path directly — signed URLs for every distinct path in
+  // this queue are fetched once up front rather than per card, since
+  // createSignedUrl is a network call and the same page image is typically
+  // reused by several cards in a row.
   const pageImageUrls = new Map<string, string>();
   void preloadPageImages();
   async function preloadPageImages(): Promise<void> {
-    const paths = [...new Set(queue.map((c) => c.notes.page_blocks?.import_pages?.rendered_page_path).filter((p): p is string => !!p))];
+    const paths = [...new Set(queue.map((c) => c.import_pages?.rendered_page_path).filter((p): p is string => !!p))];
     if (!paths.length) return;
     try {
       const entries = await Promise.all(paths.map(async (p) => [p, await getRenderedPageUrl(p)] as const));
@@ -95,7 +105,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
   void loadDeckStats();
   async function loadDeckStats(): Promise<void> {
     try {
-      deckStats = await fetchDeckStats(deck.id);
+      deckStats = await fetchDeckStats(singleDeck?.id ?? null);
     } catch {
       deckStats = null;
     }
@@ -114,7 +124,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     const ds = deckStats;
     return `
       <div class="panelbox" id="deckStatsBox">
-        <h3>${esc(deck.name)}</h3>
+        <h3>${singleDeck ? esc(singleDeck.name) : 'Your stats'}</h3>
         ${
           ds
             ? `<div class="stat-grid" style="grid-template-columns:1fr 1fr">
@@ -154,15 +164,19 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       </aside>`;
   }
 
-  /** The same split page-image + rendered-card layout the admin review UI uses, reused here so an imported card studies exactly like it reads. */
-  function importedCardBodyHTML(sourceBlock: NonNullable<CardWithNote['notes']['page_blocks']>): string {
+  /** The same split page-image + rendered-card layout the admin review UI uses, reused here so an imported card studies exactly like it reads — but only when this card's own "show source in practice" toggle is on; otherwise it's just the card content, full width. */
+  function importedCardBodyHTML(sourceBlock: CardWithNote): string {
+    const content = `<div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>`;
+    if (!sourceBlock.show_source_in_practice) {
+      return `<div class="session-imported-split session-imported-solo">${content}</div>`;
+    }
     const imagePath = sourceBlock.import_pages?.rendered_page_path ?? null;
     const imageUrl = imagePath ? pageImageUrls.get(imagePath) : null;
     return `
       <div class="session-imported-split">
-        <div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>
+        ${content}
         <div class="session-imported-right">
-          ${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original page">` : '<div class="p-text">Page image not available.</div>'}
+          ${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original source">` : '<div class="p-text">Source image not available.</div>'}
         </div>
       </div>`;
   }
@@ -176,48 +190,81 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     }
 
     const card = queue[pos];
-    const notes = card.notes;
-    const fields = notes.fields;
-    const profile = PROFILES[notes.note_type] ?? PROFILES.basic;
+    // Every generation-mode card (prompt_generated) flips and gets graded —
+    // a 'flashcard'-recipe card the classic way (front/back text swap); any
+    // other recipe (single_choice, matching_pairs, text_input, etc.) by
+    // showing its interactive widget up front, letting the learner attempt
+    // it, then revealing correct/incorrect in place on "Show answer" (see
+    // flip()/revealGeneratedOther below) before grading. A faithful-
+    // extraction card has nothing invented to hide behind a "reveal" step —
+    // it always renders already-flipped, straight into grading, exactly as
+    // before.
+    const isGenerated = card.origin === 'textbook_extraction' && card.prompt_generated;
+    const isFlashcard = isGenerated && card.component_type === 'flashcard';
+    const isGeneratedOther = isGenerated && !isFlashcard;
+    const sourceBlock = card.origin === 'textbook_extraction' && !isGenerated ? card : null;
+    const fields = card.fields ?? {};
+    const flashcardContent = isFlashcard ? (card.content as CardFlashcardContent) : null;
+    const flashcardIpa = flashcardContent?.detail?.ipa ?? null;
+    const flashcardDetailHTML = isFlashcard ? renderFlashcardDetailHTML(flashcardContent?.detail) : '';
+    const profile = PROFILES[card.note_type ?? 'basic'] ?? PROFILES.basic;
     const front = fields.front || fields.Front || '—';
     const back = fields.back || fields.Back || '—';
-    const isGenerated = (notes.tags || []).includes('generated');
-    // A card compiled from an imported page_block (see sendPageBlocksToPractice)
-    // has nothing meaningful to hide behind a "reveal" step — it's read, not
-    // guessed — so it always renders already-flipped, straight into grading,
-    // reusing the same split page-image view the review UI shows.
-    const sourceBlock = notes.page_blocks;
+    const fcFront = flashcardContent?.front ?? '—';
+    const fcBack = flashcardContent?.back ?? '—';
+    const isAiWrittenTag = (card.tags || []).includes('generated');
     if (sourceBlock) flipped = true;
     const importedFaceHTML = sourceBlock ? importedCardBodyHTML(sourceBlock) : '';
+    const generatedOtherFaceHTML = isGeneratedOther ? importedCardBodyHTML(card) : '';
 
     container.innerHTML = `
-      <div class="session-layout ${sourceBlock ? 'session-layout-wide' : ''}">
+      <div class="session-layout ${sourceBlock || isGeneratedOther ? 'session-layout-wide' : ''}">
         ${sidebarHTML()}
         <div class="session">
           <div class="sess-top">
-            <div class="sess-pill"><span class="n">${pos + 1} / ${total}</span><span>${esc(deck.name)}</span></div>
+            <div class="sess-pill"><span class="n">${pos + 1} / ${total}</span><span>${esc(deckFor(card).name)}</span></div>
             <button class="quit" id="endSessionBtn">End session</button>
           </div>
           <div class="sessbar"><span style="width:${Math.round((pos / total) * 100)}%"></span></div>
 
           <div class="zone" id="zone">
             <div class="verdict" id="verdict"><span id="verdictTxt"></span></div>
-            <div class="card ${flipped ? 'flipped' : ''} ${sourceBlock ? 'session-card-imported' : ''}" id="card">
+            <div class="card ${flipped ? 'flipped' : ''} ${sourceBlock || isGeneratedOther ? 'session-card-imported' : ''} ${isFlashcard ? 'pf-card-tall' : ''}" id="card">
               ${
                 sourceBlock
                   ? `<div class="face front">${importedFaceHTML}</div><div class="face back">${importedFaceHTML}</div>`
-                  : `
+                  : isGeneratedOther
+                    ? `<div class="face front">${generatedOtherFaceHTML}</div>`
+                    : isFlashcard
+                      ? `
               <div class="face front">
-                <div class="ctype">${esc(notes.note_type)}</div>
-                ${isGenerated ? '<div class="gtype">✨ AI-written</div>' : ''}
+                <div class="ctype">Flashcard</div>
+                <div class="center">
+                  <div class="word">${esc(fcFront)}${pronIconHTML(fcFront)}</div>
+                  ${flashcardIpa ? `<div class="pf-ipa">/${esc(flashcardIpa)}/</div>` : ''}
+                  <div class="prompt"><i class="pulse"></i> Tap the card to reveal</div>
+                </div>
+              </div>
+              <div class="face back pf-rich">
+                <div class="ctype">Flashcard</div>
+                <div class="center" style="flex:none">
+                  <div class="word small">${esc(fcFront)}</div>
+                  <div class="gloss">${esc(fcBack)}</div>
+                </div>
+                ${flashcardDetailHTML}
+              </div>`
+                    : `
+              <div class="face front">
+                <div class="ctype">${esc(card.note_type ?? 'basic')}</div>
+                ${isAiWrittenTag ? '<div class="gtype">✨ AI-written</div>' : ''}
                 <div class="center">
                   <div class="word">${esc(front)}</div>
                   <div class="prompt"><i class="pulse"></i> Tap the card to reveal</div>
                 </div>
               </div>
               <div class="face back">
-                <div class="ctype">${esc(notes.note_type)}</div>
-                ${isGenerated ? '<div class="gtype">✨ AI-written</div>' : ''}
+                <div class="ctype">${esc(card.note_type ?? 'basic')}</div>
+                ${isAiWrittenTag ? '<div class="gtype">✨ AI-written</div>' : ''}
                 <div class="center">
                   <div class="word small">${esc(front)}</div>
                   <div class="gloss">${esc(back)}</div>
@@ -258,18 +305,10 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     $(container, '#endSessionBtn').addEventListener('click', deps.onEnd);
 
     if (flipped) {
-      const prev = previewAll(card, deck.desired_retention);
-      $<HTMLElement>(container, '#gradeAgain .gwhen').textContent = prev[1];
-      $<HTMLElement>(container, '#gradeGood .gwhen').textContent = prev[3];
-      $<HTMLElement>(container, '#gradeHard .gwhen').textContent = prev[2];
-      $<HTMLElement>(container, '#gradeEasy .gwhen').textContent = prev[4];
-      $(container, '#gradeAgain').addEventListener('click', () => void grade(1));
-      $(container, '#gradeHard').addEventListener('click', () => void grade(2));
-      $(container, '#gradeGood').addEventListener('click', () => void grade(3));
-      $(container, '#gradeEasy').addEventListener('click', () => void grade(4));
+      wireGradeButtons(card);
       if (sourceBlock) {
         container.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => wireReadModeBlock(sourceBlock, el));
-      } else {
+      } else if (!isFlashcard && !isGeneratedOther) {
         buildChips(profile.chips, fields);
         if (openChipIndex != null) openPanel(visibleChips[openChipIndex], fields);
       }
@@ -277,7 +316,16 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       $(container, '#flipBtn').addEventListener('click', flip);
     }
 
-    attachInteractions();
+    // The interactive widget itself is wired regardless of flip state — the
+    // learner attempts it BEFORE flipping (that's the whole point), and
+    // flip() reveals correct/incorrect on this same live DOM rather than
+    // re-rendering, so wiring only needs to happen once, here.
+    if (isGeneratedOther) {
+      container.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => wireReadModeBlock(card, el));
+    }
+    if (isFlashcard) wirePronunciationIcons(container);
+
+    attachInteractions(isGeneratedOther);
   }
 
   function renderDone(): void {
@@ -287,7 +335,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       <div class="session" style="max-width:600px;margin:0 auto;padding:22px 18px 40px">
         <div class="done">
           <h2>Session complete 🎉</h2>
-          <p>${esc(deck.name)}</p>
+          <p>${singleDeck ? esc(singleDeck.name) : 'All decks'}</p>
           <div class="stat-grid">
             <div class="stat-item"><div class="stat-v">${total}</div><div class="stat-k">reviewed</div></div>
             <div class="stat-item"><div class="stat-v">${acc}%</div><div class="stat-k">accuracy</div></div>
@@ -313,10 +361,55 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     $(container, '#doneStatsBtn').addEventListener('click', deps.onSeeAllStats);
   }
 
+  function wireGradeButtons(card: CardWithNote): void {
+    const prev = previewAll(card, deckFor(card).desired_retention);
+    $<HTMLElement>(container, '#gradeAgain .gwhen').textContent = prev[1];
+    $<HTMLElement>(container, '#gradeGood .gwhen').textContent = prev[3];
+    $<HTMLElement>(container, '#gradeHard .gwhen').textContent = prev[2];
+    $<HTMLElement>(container, '#gradeEasy .gwhen').textContent = prev[4];
+    $(container, '#gradeAgain').addEventListener('click', () => void grade(1));
+    $(container, '#gradeHard').addEventListener('click', () => void grade(2));
+    $(container, '#gradeGood').addEventListener('click', () => void grade(3));
+    $(container, '#gradeEasy').addEventListener('click', () => void grade(4));
+  }
+
+  const GRADE_ROW_HTML = `
+    <div class="grade-row">
+      <button class="grade g-again" id="gradeAgain"><span class="gname">Again</span><span class="gwhen"></span></button>
+      <button class="grade g-good" id="gradeGood"><span class="gname">Good</span><span class="gwhen"></span></button>
+    </div>
+    <div class="grade-row">
+      <button class="grade g-hard" id="gradeHard"><span class="gname">Hard</span><span class="gwhen"></span></button>
+      <button class="grade g-easy" id="gradeEasy"><span class="gname">Easy</span><span class="gwhen"></span></button>
+    </div>
+    <div class="legend"><span>← Again</span><span>↑ Hard</span><span>→ Good</span><span>↓ Easy</span></div>`;
+
+  /**
+   * A non-flashcard generation-mode card's "flip" doesn't swap faces (front
+   * and back are the same live interactive widget) — it checks the
+   * learner's current attempt in place via the same logic Manage's Verify
+   * button uses, then swaps the flip-cta for grade buttons. Deliberately NOT
+   * a full render(): that would replace the widget's DOM and lose whatever
+   * the learner picked/typed.
+   */
+  function revealGeneratedOther(card: CardWithNote): void {
+    const el = container.querySelector<HTMLElement>('[data-read-block-id]');
+    if (el) computeVerifyOutcome(card, el);
+    const controls = document.getElementById('controls');
+    if (controls) controls.innerHTML = GRADE_ROW_HTML;
+    wireGradeButtons(card);
+  }
+
   function flip(): void {
     if (flipped) return;
     flipped = true;
-    render();
+    const card = queue[pos];
+    const isGeneratedOther = card.origin === 'textbook_extraction' && card.prompt_generated && card.component_type !== 'flashcard';
+    if (isGeneratedOther) {
+      revealGeneratedOther(card);
+    } else {
+      render();
+    }
   }
 
   /** Grades the current card: fly-off animation, commit via FSRS, then advance. Same path for buttons and swipe. */
@@ -324,7 +417,8 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     const card = queue[pos];
     const gi = g - 1;
     sessRatings[g] += 1;
-    const when = previewAll(card, deck.desired_retention)[g];
+    const retention = deckFor(card).desired_retention;
+    const when = previewAll(card, retention)[g];
     toast(`${GRADE_META[gi].n} — back in ${when}`);
 
     const [dx, dy] = GRADE_DIR[gi];
@@ -335,7 +429,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
       cardEl.style.opacity = '0';
     }
 
-    const commitPromise = commitGrade(card, g, deck.desired_retention).catch((e) => toast('Save failed: ' + errMsg(e)));
+    const commitPromise = commitGrade(card, g, retention).catch((e) => toast('Save failed: ' + errMsg(e)));
     await new Promise((r) => setTimeout(r, 320));
     await commitPromise;
 
@@ -398,13 +492,22 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
 
   // ---------- swipe / drag ----------
 
-  function attachInteractions(): void {
+  /**
+   * suppressGesture is true for a non-flashcard generation-mode card: its
+   * whole widget is full of real clickable/typeable content (choice
+   * buttons, matching items, text inputs), so the usual tap-anywhere /
+   * swipe-to-flip-or-grade gesture would swallow those clicks. Only the
+   * explicit "Show answer" button and grade buttons work for these —
+   * everything else here becomes a no-op.
+   */
+  function attachInteractions(suppressGesture: boolean): void {
     const zone = document.getElementById('zone');
     if (!zone) return;
     const cardEl = document.getElementById('card');
 
     zone.onpointerdown = (e: PointerEvent) => {
-      if ((e.target as HTMLElement | null)?.closest('.chip')) return;
+      if (suppressGesture) return;
+      if ((e.target as HTMLElement | null)?.closest('.chip, .pron-icon')) return;
       sx = e.clientX;
       sy = e.clientY;
       dragging = true;
@@ -419,6 +522,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     };
 
     zone.onpointermove = (e: PointerEvent) => {
+      if (suppressGesture) return;
       if (!dragging) return;
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
@@ -443,6 +547,7 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
     };
 
     function endDrag(e: PointerEvent): void {
+      if (suppressGesture) return;
       if (!dragging) return;
       dragging = false;
       const c = document.getElementById('card');
@@ -468,7 +573,8 @@ export function renderSession(container: HTMLElement, deck: Deck, queue: CardWit
 
     if (cardEl) {
       cardEl.onclick = (e: MouseEvent) => {
-        if ((e.target as HTMLElement | null)?.closest('.chip') || moved) return;
+        if (suppressGesture) return;
+        if ((e.target as HTMLElement | null)?.closest('.chip, .pron-icon') || moved) return;
         if (!flipped) flip();
       };
     }
@@ -515,6 +621,9 @@ interface ExamplePairLike {
 }
 
 function renderPanelValue(as: ChipAs | undefined, val: unknown): string {
+  if (as === 'list' && Array.isArray(val)) {
+    return `<div class="p-text">${(val as unknown[]).map((v) => esc(v)).join('<br>')}</div>`;
+  }
   if (as === 'examples' && Array.isArray(val)) {
     const items: ExamplePairLike[] = typeof val[0] === 'string' ? [{ fr: val[0], en: val[1] }] : val;
     return items

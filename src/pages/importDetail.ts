@@ -324,7 +324,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
         <button class="back-link" id="backBtn">← ${esc(deps.deckName)}</button>
         <div class="page-h">
           <h1>${imp ? esc(imp.title) : 'Import'}</h1>
-          <p>Textbook import for <strong>${esc(deps.deckName)}</strong>.</p>
+          <p>Source import for <strong>${esc(deps.deckName)}</strong>.</p>
         </div>
         <div id="importBody"></div>
       </div>`;
