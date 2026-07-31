@@ -25,7 +25,7 @@ import '@supabase/functions-js/edge-runtime.d.ts';
 
 import { createClient } from '@supabase/supabase-js';
 import { processOnePreprocessJob, requeueStalePreprocessJobs } from '../_shared/preprocessWorker.ts';
-import { processExtractionJobsBatch } from '../_shared/extractWorker.ts';
+import { processExtractionJobsBatch, requeueStaleExtractionJobs } from '../_shared/extractWorker.ts';
 
 const BUDGET_MS = 45_000;
 // How many pages to extract concurrently per tick. Bounded conservatively —
@@ -66,7 +66,14 @@ Deno.serve(async (req) => {
   // never 'processing' for anywhere near PREPROCESS_STALE_AFTER_MS. This
   // only matters if an invocation dies outright (platform kill, crash)
   // instead of returning cleanly.
-  const requeuedStale = await requeueStalePreprocessJobs(supabase).catch(() => 0);
+  const requeuedStalePreprocess = await requeueStalePreprocessJobs(supabase).catch(() => 0);
+  // Same idea for extract_page — previously had NO automatic recovery at
+  // all (only the admin-triggered "Requeue stale jobs" button), so a job
+  // the platform killed mid-flight (see extractWorker.ts's
+  // MAX_CHARS_PER_REQUEST/CHUNK_LOOP_BUDGET_MS comments) sat stuck in
+  // 'processing' forever until someone noticed and clicked it.
+  const requeuedStaleExtraction = await requeueStaleExtractionJobs(supabase).catch(() => 0);
+  const requeuedStale = requeuedStalePreprocess + requeuedStaleExtraction;
 
   for (;;) {
     if (Date.now() - start >= BUDGET_MS) break;

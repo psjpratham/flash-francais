@@ -24,17 +24,22 @@ const DEFAULT_MODEL = 'gemini-flash-lite-latest';
 // alone add real weight per block). 24576 leaves comfortable headroom above
 // the ~8000 tokens that page actually needed once given room to finish.
 const DEFAULT_MAX_OUTPUT_TOKENS = 24576;
-// 60s was too tight for a genuinely dense generation — verified directly:
-// a YouTube-transcript chunk asking for a card per phrase (~214 short
-// caption lines in one chunk, "create cards for all the phrases mentioned
-// in the video") reliably hit exactly 60.0s and failed with
-// provider_timeout, while ordinary textbook-page extractions complete in
-// 7-11s. 100s leaves ~50s of margin under Supabase Edge Functions' 150s
-// free-tier wall-clock ceiling (docs.supabase.com/guides/functions/limits)
-// even accounting for the rest of processClaimedExtractionJob's overhead
-// in the same invocation — going much higher risks the whole dispatcher
-// invocation getting killed by the platform instead of failing gracefully.
-const REQUEST_TIMEOUT_MS = 100_000;
+// Briefly raised to 100s after a dense chunk (~214 lines, "card for every
+// phrase") hit the old 60s ceiling — but that made things WORSE, not
+// better: runFullExtraction's chunk loop is sequential, and this timeout
+// applies per attempt (up to 2 attempts per chunk) — 100s let a
+// multi-chunk page's worst case exceed Supabase Edge Functions' 150s
+// free-tier wall-clock ceiling (docs.supabase.com/guides/functions/limits),
+// so the platform killed the invocation outright: no graceful error, the
+// job just sits stuck in 'processing' forever. The real fix was shrinking
+// MAX_CHARS_PER_REQUEST (extractWorker.ts, 6000 -> 2000) so no single call
+// has to produce that much output in the first place — ordinary textbook-
+// page extractions complete in 7-11s regardless of this constant. 70s
+// keeps real per-call variance covered while a stale/failed call still
+// fails gracefully well before the platform's hard ceiling, especially
+// combined with extractWorker.ts's own CHUNK_LOOP_BUDGET_MS/withinJobBudget
+// guards that now bound total per-job wall time independently of this.
+const REQUEST_TIMEOUT_MS = 70_000;
 
 export interface ProviderUsage {
   promptTokens?: number;

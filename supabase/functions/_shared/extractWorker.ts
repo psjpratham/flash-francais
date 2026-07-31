@@ -28,9 +28,29 @@ import { formatNumberedLines, toSourceLines, type SourceLine } from './sourceLin
 import { validatePage, type ValidatedBlock } from './blockValidation.ts';
 import { checkCoverage, coverageHasIssues, type CoverageResult } from './coverage.ts';
 
-const MAX_CHARS_PER_REQUEST = 6000;
+// Was 6000 — verified directly that this let a single chunk (a 214-line
+// YouTube-transcript slice under an exhaustive "card for every phrase"
+// prompt) demand ~214 generated blocks in one call, hitting Gemini's
+// per-call timeout and, worse, letting a sequential multi-chunk page blow
+// past Supabase's platform wall-clock ceiling with the function killed
+// mid-flight (no graceful error — the job just sits stuck in 'processing'
+// forever). Smaller chunks bound how much any single call has to produce,
+// keeping calls fast regardless of how content-dense/exhaustive the source
+// or prompt is; ordinary textbook pages (a handful of exercises) are
+// unaffected either way. See the chunk-loop time budget below for the
+// other half of this fix.
+const MAX_CHARS_PER_REQUEST = 2000;
 const MAX_REPAIR_ATTEMPTS = 2;
 const JOB_TIME_BUDGET_MS = 150_000;
+// Hard ceiling on the extraction chunk loop alone (runFullExtraction),
+// separate from JOB_TIME_BUDGET_MS which also has to leave room for the
+// audit/repair loop and polish pass that run AFTER it. Once past this, the
+// loop stops requesting further chunks and returns whatever it already has
+// as a genuine (if partial) success — the existing coverage checker
+// already surfaces any un-covered source lines as a "missing_lines"
+// warning, so this degrades to an honest partial extraction instead of an
+// invisible platform kill.
+const CHUNK_LOOP_BUDGET_MS = 90_000;
 const PAGE_PDF_BUCKET = 'import-page-pdfs';
 const SOURCES_BUCKET = 'import-sources';
 const PAGE_PDF_DOWNLOAD_TIMEOUT_MS = 15_000;
@@ -203,8 +223,18 @@ async function runFullExtraction(
   const usage: ProviderUsage = {};
   let model = getConfiguredGeminiModel();
   let detectedLanguage: string | null = null;
+  const chunkLoopStart = Date.now();
 
   for (const chunk of chunks) {
+    // Unusually many/dense chunks (e.g. a long transcript under an
+    // exhaustive prompt) stop here rather than keep going toward a platform
+    // kill — whatever's accumulated so far is returned as a genuine partial
+    // success (allBlocks/allWarnings), never thrown away. The coverage
+    // checker downstream already turns any now-uncovered source lines into
+    // a "missing_lines" warning on its own, so this is an honest partial
+    // result, not a silent truncation.
+    if (allBlocks.length > 0 && Date.now() - chunkLoopStart > CHUNK_LOOP_BUDGET_MS) break;
+
     // The page-PDF attachment (like imageRegions) is only sent once per
     // page — on the single/first chunk — rather than re-uploaded with every
     // chunked call for an unusually text-dense page.
@@ -541,13 +571,21 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   // like a premium, finished set of cards" (duplicate labels, fragment
   // cards, wrong recipe choice). Never allowed to fail the job: if the call
   // errors, returns invalid JSON, or fails validation, the pre-polish
-  // blocks are simply used as-is.
+  // blocks are simply used as-is. Also skipped outright once withinJobBudget()
+  // is false — unlike the repair loop above (which already stops entering new
+  // iterations at that point), this call had NO budget gate before, meaning a
+  // job that used up its time budget on extraction/repair would still make
+  // one more unconditional call here, risking the platform kill this whole
+  // budget system exists to avoid. A skipped polish pass just means
+  // already-good blocks ship un-polished, never a failure.
   let polishApplied = false;
-  const polishOutcome = await callGemini({
-    systemPrompt: POLISH_SYSTEM_PROMPT,
-    userPrompt: buildPolishUserPrompt({ currentExtractionJson: { blocks, page_warnings: modelWarnings }, existingTags }),
-    inlineData: pdfInlineData,
-  });
+  const polishOutcome = withinJobBudget()
+    ? await callGemini({
+        systemPrompt: POLISH_SYSTEM_PROMPT,
+        userPrompt: buildPolishUserPrompt({ currentExtractionJson: { blocks, page_warnings: modelWarnings }, existingTags }),
+        inlineData: pdfInlineData,
+      })
+    : { ok: false as const, error: 'skipped_over_budget', latencyMs: 0, model: '' };
   if (polishOutcome.ok) {
     const parsedPolish = parseJsonContent(polishOutcome.content);
     if (parsedPolish.ok) {
@@ -671,6 +709,28 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   await maybeFinalizeImport(supabase, importId);
 
   return { claimed: true, jobId: job.id };
+}
+
+// A healthy job should never be 'processing' anywhere near this long — the
+// per-call timeout (gemini.ts) plus this file's own budgets bound normal
+// completion well under it. Matches the client-side STALE_AFTER_MS
+// (src/lib/pageExtractions.ts) that the "Requeue stale jobs" admin button
+// already uses, so this is the same threshold, just applied automatically
+// instead of requiring someone to notice and click a button.
+export const EXTRACTION_STALE_AFTER_MS = 5 * 60 * 1000;
+
+/** Requeues extract_page jobs orphaned in 'processing' beyond EXTRACTION_STALE_AFTER_MS — was previously ONLY handled by an admin manually clicking "Requeue stale jobs" (src/lib/pageExtractions.ts's requeueStaleExtractionJobs); a job the platform killed mid-flight (no graceful error — see MAX_CHARS_PER_REQUEST's comment above) would otherwise sit stuck forever without one. Mirrors preprocessWorker.ts's requeueStalePreprocessJobs. Fallback only — the chunk/job time budgets above should make an actual platform kill rare now. */
+export async function requeueStaleExtractionJobs(supabase: SupabaseClient): Promise<number> {
+  const thresholdISO = new Date(Date.now() - EXTRACTION_STALE_AFTER_MS).toISOString();
+  const { data, error } = await supabase
+    .from('jobs')
+    .update({ status: 'queued', started_at: null })
+    .eq('type', 'extract_page')
+    .eq('status', 'processing')
+    .or(`started_at.lt.${thresholdISO},and(started_at.is.null,created_at.lt.${thresholdISO})`)
+    .select('id');
+  if (error) return 0;
+  return data?.length ?? 0;
 }
 
 export async function processOneExtractionJob(supabase: SupabaseClient): Promise<ExtractResult> {
