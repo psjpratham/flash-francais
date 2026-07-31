@@ -24,22 +24,22 @@ const DEFAULT_MODEL = 'gemini-flash-lite-latest';
 // alone add real weight per block). 24576 leaves comfortable headroom above
 // the ~8000 tokens that page actually needed once given room to finish.
 const DEFAULT_MAX_OUTPUT_TOKENS = 24576;
-// Briefly raised to 100s after a dense chunk (~214 lines, "card for every
-// phrase") hit the old 60s ceiling — but that made things WORSE, not
-// better: runFullExtraction's chunk loop is sequential, and this timeout
-// applies per attempt (up to 2 attempts per chunk) — 100s let a
-// multi-chunk page's worst case exceed Supabase Edge Functions' 150s
-// free-tier wall-clock ceiling (docs.supabase.com/guides/functions/limits),
-// so the platform killed the invocation outright: no graceful error, the
-// job just sits stuck in 'processing' forever. The real fix was shrinking
-// MAX_CHARS_PER_REQUEST (extractWorker.ts, 6000 -> 2000) so no single call
-// has to produce that much output in the first place — ordinary textbook-
-// page extractions complete in 7-11s regardless of this constant. 70s
-// keeps real per-call variance covered while a stale/failed call still
-// fails gracefully well before the platform's hard ceiling, especially
-// combined with extractWorker.ts's own CHUNK_LOOP_BUDGET_MS/withinJobBudget
-// guards that now bound total per-job wall time independently of this.
-const REQUEST_TIMEOUT_MS = 70_000;
+// 100s was tried once and made things WORSE (a multi-chunk page's worst
+// case exceeded Supabase's 150s free-tier per-invocation wall-clock
+// ceiling, so the platform killed the function outright — no graceful
+// error, job stuck in 'processing' forever). Chunking is now a rare
+// fallback (extractWorker.ts's MAX_CHARS_PER_REQUEST=24000, one call for
+// almost any real source), which removed the multi-chunk-stacking risk —
+// but a single call generating close to GLOBAL_MAX_BLOCKS_PER_PAGE worth of
+// verbose flashcards can still legitimately take over a minute (verified:
+// ~100 blocks needed ~130s+ total across a truncate-and-retry cycle at 70s).
+// 80s is a deliberate small bump, not a return to 100s — it has to stay
+// well under the 150s whole-invocation ceiling alongside everything else
+// processClaimedExtractionJob does in the same call (page/stacks
+// reads/writes, audit/repair, polish, card inserts), which is exactly why
+// GLOBAL_MAX_BLOCKS_PER_PAGE (extractWorker.ts) was lowered in the same
+// change — this alone was not treated as sufficient on its own.
+const REQUEST_TIMEOUT_MS = 80_000;
 
 export interface ProviderUsage {
   promptTokens?: number;

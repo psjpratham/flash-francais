@@ -138,7 +138,13 @@ const MAX_OUTPUT_TOKENS_CEILING = 65536;
 // make a slow call finish faster. The hard downsample at the end of
 // runFullExtraction is the backstop for whenever the model doesn't fully
 // comply, not the primary mechanism.
-const GLOBAL_MAX_BLOCKS_PER_PAGE = 100;
+// Was 100 — verified directly that generating that many verbose flashcard
+// blocks (front/back/detail with IPA, examples, tips) in one call needed
+// 130s+ (a truncate-at-MAX_TOKENS-then-retry cycle, each attempt against
+// gemini.ts's REQUEST_TIMEOUT_MS), exceeding what a single call can
+// reliably do inside Supabase's 150s whole-invocation ceiling. 80 paired
+// with the REQUEST_TIMEOUT_MS bump (70s -> 80s) there.
+const GLOBAL_MAX_BLOCKS_PER_PAGE = 80;
 
 async function runOneExtractionCall(
   numberedLines: string,
