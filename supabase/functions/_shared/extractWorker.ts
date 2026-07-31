@@ -121,6 +121,17 @@ interface ExtractionCallResult {
 
 const MAX_JSON_PARSE_ATTEMPTS = 2;
 const MAX_OUTPUT_TOKENS_CEILING = 65536;
+// A hard ceiling on a page's total card count — the actual guardrail behind
+// the "create a card for every phrase" case that kept timing out. Without
+// this, an exhaustive prompt over a large/dense source has no natural
+// upper bound on how much a single call has to generate. maxBlocksHint
+// (below, computed per-chunk in runFullExtraction) asks the model to stay
+// under its share of this budget AS IT GENERATES — the actual fix for
+// call duration, since a mechanical cap applied only after the fact can't
+// make a slow call finish faster. The hard downsample at the end of
+// runFullExtraction is the backstop for whenever the model doesn't fully
+// comply, not the primary mechanism.
+const GLOBAL_MAX_BLOCKS_PER_PAGE = 100;
 
 async function runOneExtractionCall(
   numberedLines: string,
@@ -132,13 +143,14 @@ async function runOneExtractionCall(
   visualMimeType = 'application/pdf',
   answerKey?: { mimeType: string; base64: string } | null,
   promptOnly?: boolean,
+  maxBlocksHint?: number,
 ): Promise<ExtractionCallResult> {
   const inlineData = [pagePdfBase64 ? { mimeType: visualMimeType, base64: pagePdfBase64 } : null, answerKey ? { mimeType: answerKey.mimeType, base64: answerKey.base64 } : null].filter(
     (d): d is { mimeType: string; base64: string } => d !== null,
   );
   const baseCallParams = {
     systemPrompt: SYSTEM_PROMPT,
-    userPrompt: buildUserPrompt({ pageNumber: 0, numberedSourceLines: numberedLines, imageRegions, adminInstructions, imageOnly, promptOnly, existingTags, hasAnswerKey: !!answerKey }),
+    userPrompt: buildUserPrompt({ pageNumber: 0, numberedSourceLines: numberedLines, imageRegions, adminInstructions, imageOnly, promptOnly, existingTags, hasAnswerKey: !!answerKey, maxBlocksHint }),
     inlineData: inlineData.length ? inlineData : undefined,
   };
 
@@ -215,6 +227,13 @@ async function runFullExtraction(
   // extraction entirely — force one (empty) chunk so the model still gets
   // called (with the page image, or with nothing but admin_instructions).
   const chunks = sourceLines.length ? splitIntoLineChunks(sourceLines) : imageOnly || promptOnly ? [[]] : [];
+  // Each chunk's own share of the page-wide cap — e.g. 4 chunks under a
+  // 100-block budget means each is asked to stay under ~25. This is what
+  // actually keeps a single call's generation (and therefore its duration)
+  // bounded, spread proportionally across every chunk rather than just the
+  // first one — so coverage stays spread across the WHOLE source instead of
+  // exhausting the budget on its opening lines and going silent after.
+  const maxBlocksPerChunk = Math.max(1, Math.ceil(GLOBAL_MAX_BLOCKS_PER_PAGE / Math.max(1, chunks.length)));
   let orderCursor = 0;
   const allBlocks: ValidatedBlock[] = [];
   const allWarnings: PageWarningOut[] = [];
@@ -249,6 +268,7 @@ async function runFullExtraction(
       visualMimeType,
       isFirstChunk ? answerKey : null,
       promptOnly,
+      maxBlocksPerChunk,
     );
     totalLatencyMs += result.latencyMs ?? 0;
     if (result.model) model = result.model;
@@ -275,7 +295,29 @@ async function runFullExtraction(
     allWarnings.push(...(result.pageWarnings ?? []));
   }
 
-  return { ok: true, blocks: allBlocks, pageWarnings: allWarnings, detectedLanguage, raw: allRaw, totalLatencyMs, usage, model };
+  // Backstop, not the primary mechanism (see maxBlocksHint above) — the
+  // model doesn't always perfectly respect a soft per-chunk instruction.
+  // Downsampled EVENLY across order_index rather than simply truncated to
+  // the first N, so a still-over-budget result keeps spread across the
+  // whole page/source instead of only covering its opening content.
+  let finalBlocks = allBlocks;
+  let finalWarnings = allWarnings;
+  if (allBlocks.length > GLOBAL_MAX_BLOCKS_PER_PAGE) {
+    const stride = allBlocks.length / GLOBAL_MAX_BLOCKS_PER_PAGE;
+    const kept = new Set<number>();
+    for (let i = 0; i < GLOBAL_MAX_BLOCKS_PER_PAGE; i++) kept.add(Math.floor(i * stride));
+    const droppedCount = allBlocks.length - kept.size;
+    finalBlocks = allBlocks.filter((_, i) => kept.has(i)).map((b, i) => ({ ...b, order_index: i }));
+    finalWarnings = [
+      ...allWarnings,
+      {
+        code: 'block_cap_applied',
+        message: `This page generated ${allBlocks.length} cards, over the ${GLOBAL_MAX_BLOCKS_PER_PAGE}-card cap — ${droppedCount} were dropped (evenly spread across the source, not just the end) to keep extraction fast and reliable.`,
+      },
+    ];
+  }
+
+  return { ok: true, blocks: finalBlocks, pageWarnings: finalWarnings, detectedLanguage, raw: allRaw, totalLatencyMs, usage, model };
 }
 
 function coverageToWarnings(coverage: CoverageResult): PageWarningOut[] {

@@ -405,6 +405,8 @@ export function buildUserPrompt(input: {
   existingTags?: string[];
   /** True when an answer-key document (corrige) is attached alongside the page image — see ANSWER KEY in SYSTEM_PROMPT. False/absent means today's default: every answer field stays null, every answer_key_status stays "unknown". */
   hasAnswerKey?: boolean;
+  /** This chunk's share of a page-wide card-count cap (see GLOBAL_MAX_BLOCKS_PER_PAGE in extractWorker.ts) — exists for an exhaustive admin instruction ("a card for every X") over unusually large/dense content, where nothing else bounds how much a single call has to generate. Absent/undefined means no particular limit applies (the ordinary case). */
+  maxBlocksHint?: number;
 }): string {
   const imageOnly = !!input.imageOnly;
   const promptOnly = !!input.promptOnly;
@@ -460,6 +462,11 @@ export function buildUserPrompt(input: {
     input.adminInstructions
       ? `- Admin instructions are attached below — this is GENERATION MODE, not faithful extraction: every recall-style item (vocabulary term, grammar point) MUST be a "flashcard" card, never "vocabulary"/"grammar_rule"/a terms table, regardless of what the instructions specifically say. Every interaction recipe's answer field must be populated with your own best answer, even unguided. Front/back/detail/answers are authored${promptOnly ? ', and so is source_text itself (see PROMPT-ONLY above)' : ', grounded in real page content — source_text itself is still always verbatim'}.`
       : '- No admin instructions are attached — use only the normal document/interaction recipes; "flashcard" is never appropriate here.',
+    ...(input.maxBlocksHint
+      ? [
+          `- Generate AT MOST ${input.maxBlocksHint} cards from this chunk. If there is more recallable content here than that, do not try to cover every single item — pick the ${input.maxBlocksHint} most useful/representative ones, spread across this chunk's content rather than clustered at its start, and skip the rest. Breadth of coverage across the whole chunk matters more than exhaustively capturing every phrase.`,
+        ]
+      : []),
     '- Return JSON matching the required schema only.',
     ...(input.adminInstructions ? ['', 'ADMIN INSTRUCTIONS', input.adminInstructions] : []),
   ].join('\n');
