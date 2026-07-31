@@ -236,6 +236,35 @@ export async function resumePreprocessing(importId: string, deckId: string): Pro
 }
 
 /**
+ * Cancels an in-progress import — deletes every queued/processing job tied
+ * to it (RLS lets an owner delete/update their own `jobs` rows directly,
+ * see 20260812000000_retire_admin_role.sql, so this needs no server
+ * involvement) and marks the import 'failed' with a clear "cancelled by
+ * user" reason (there's no dedicated 'cancelled' status in the imports
+ * table's check constraint — reusing 'failed' means the existing
+ * uploaded/preprocessing/extracting UI, which already treats 'failed' as
+ * terminal, needs no changes to show this correctly).
+ *
+ * A job already mid-flight on the server isn't actually killed — that's
+ * not possible from the browser — but complete_job/fail_job both guard
+ * `and status = 'processing'`, so once this deletes that row, whichever
+ * invocation is still running just finds nothing to update when it
+ * eventually finishes and silently no-ops. Nothing ever picks this
+ * import's work back up afterward, since extract_page/preprocess_import
+ * retries are manual-only (see extractWorker.ts/preprocessWorker.ts) —
+ * there's no automatic requeue that could resurrect a cancelled import.
+ */
+export async function cancelImport(importId: string, deckId: string): Promise<void> {
+  const { error: jobsError } = await supabase.from('jobs').delete().eq('deck_id', deckId).eq('payload->>import_id', importId).in('status', ['queued', 'processing']);
+  if (jobsError) throw jobsError;
+  const { error } = await supabase
+    .from('imports')
+    .update({ status: 'failed', preprocessing_error: 'Cancelled by user.', last_progress_at: new Date().toISOString() })
+    .eq('id', importId);
+  if (error) throw error;
+}
+
+/**
  * Permanently deletes an import and everything it produced — full cleanup,
  * not a soft hide. `imports` cascades (via FK ON DELETE CASCADE) through
  * `import_files` and `import_pages`, which in turn cascades to every

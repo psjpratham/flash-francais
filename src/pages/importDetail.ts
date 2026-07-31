@@ -1,11 +1,11 @@
 import { computeImportDiagnostics, type ImportDiagnostics } from '../lib/importDiagnostics';
-import { getImportById, hasActivePreprocessJob, resumePreprocessing, retryFailedPreprocessingPages } from '../lib/imports';
+import { cancelImport, getImportById, hasActivePreprocessJob, resumePreprocessing, retryFailedPreprocessingPages } from '../lib/imports';
 import { startImportPolling } from '../lib/importPolling';
 import { computeTextbookImportProgress, isTerminal, STAGE, type TextbookImportProgress } from '../lib/importProgress';
 import { hasAnyPageExtractions, requeueStaleExtractionJobs, retryFailedExtractionJobs, retryOneExtractionJob } from '../lib/pageExtractions';
 import { renderPendingPageImages } from '../lib/pageRender';
 import type { Import } from '../types';
-import { $, errMsg, esc, toast } from '../lib/dom';
+import { $, confirmDialog, errMsg, esc, toast } from '../lib/dom';
 import { renderImportProgress } from './importProgressView';
 import { renderAdminJobsTable, renderImportDetailsSummary } from './adminDiagnosticsView';
 
@@ -43,6 +43,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
   let diagError: string | null = null;
   let hasActiveJob = false;
   let preprocessBusy = false;
+  let cancelBusy = false;
 
   let stopPolling: (() => void) | null = null;
 
@@ -119,6 +120,37 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
       toast('Could not retry failed pages: ' + errMsg(e));
     } finally {
       preprocessBusy = false;
+      render();
+    }
+  }
+
+  /**
+   * Stops an import that's still actively uploading/preprocessing/
+   * extracting — deletes its queued/processing jobs and marks it 'failed'
+   * (see cancelImport's doc comment for why there's no dedicated
+   * 'cancelled' status). Anything already extracted stays exactly as it
+   * is; this only stops further work from happening.
+   */
+  async function runCancelImport(): Promise<void> {
+    if (cancelBusy) return;
+    const ok = await confirmDialog(
+      'Cancel this import? Anything already extracted stays as-is, but nothing further will be processed.',
+      'Cancel import',
+      'Keep going',
+    );
+    if (!ok) return;
+    cancelBusy = true;
+    render();
+    try {
+      await cancelImport(deps.importId, deps.deckId);
+      toast('Import cancelled');
+      imp = await getImportById(deps.importId);
+      progress = await computeTextbookImportProgress(deps.importId);
+      hasActiveJob = false;
+    } catch (e) {
+      toast('Could not cancel import: ' + errMsg(e));
+    } finally {
+      cancelBusy = false;
       render();
     }
   }
@@ -290,6 +322,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
           ${showRetryFailedPages ? `<button class="btn-sec" id="retryFailedPagesBtn" ${preprocessBusy ? 'disabled' : ''}>Retry failed pages (${imp.pages_failed_preprocessing})</button>` : ''}
           ${showRetryFailedExtraction ? `<button class="btn-sec" id="retryFailedExtractionBtn" ${diagBusy ? 'disabled' : ''}>Retry failed extraction (${failedExtractionCount})</button>` : ''}
           ${showOpenReview ? `<button class="btn-sec" id="openReviewBtn">📄 Open page review</button>` : ''}
+          ${!isTerminal(progress.status) ? `<button class="btn-danger" id="cancelImportBtn" ${cancelBusy ? 'disabled' : ''}>${cancelBusy ? 'Cancelling…' : '✕ Cancel import'}</button>` : ''}
         </div>
       </div>
       ${renderDetailsSection()}`;
@@ -299,6 +332,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
     document.getElementById('resumePreprocessBtn')?.addEventListener('click', () => void runResumePreprocessing());
     document.getElementById('retryFailedPagesBtn')?.addEventListener('click', () => void runRetryFailedPreprocessingPages());
     document.getElementById('retryFailedExtractionBtn')?.addEventListener('click', () => void runRetryAllFailed());
+    document.getElementById('cancelImportBtn')?.addEventListener('click', () => void runCancelImport());
     wireDiagnostics();
   }
 
