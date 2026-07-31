@@ -260,6 +260,15 @@ async function runFullExtraction(
     }
     if (result.raw) allRaw.push(result.raw);
     if (!result.ok || !result.blocks) {
+      // A later chunk failing (e.g. its own call hit the per-call timeout)
+      // used to discard every block already extracted from EARLIER
+      // successful chunks too — a genuinely dense multi-chunk page (like a
+      // long transcript) would lose real, already-generated cards over one
+      // slow chunk. If there's something to salvage, keep it — same "honest
+      // partial success" reasoning as the budget check above, just for a
+      // hard failure instead of a time cutoff. Only the very first chunk
+      // failing (nothing yet to salvage) still fails the whole page.
+      if (allBlocks.length > 0) break;
       return { ok: false, blocks: allBlocks, pageWarnings: allWarnings, detectedLanguage, raw: allRaw, totalLatencyMs, usage, model, error: result.error };
     }
     for (const b of result.blocks) allBlocks.push({ ...b, order_index: orderCursor++ });
