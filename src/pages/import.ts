@@ -3,6 +3,7 @@ import type { ImportItem } from '../lib/cards';
 import { classifyImportError } from '../lib/importErrors';
 import { createImport, createImportFileRecord, createPromptOnlyImport, enqueuePreprocessing, IMPORT_SOURCES, updateImportFileStatus, uploadImportSourceFile } from '../lib/imports';
 import { STAGE, type ImportProgress } from '../lib/importProgress';
+import { fetchYoutubeTranscript } from '../lib/youtubeTranscript';
 import { $, errMsg, esc, toast } from '../lib/dom';
 import { renderImportProgress } from './importProgressView';
 
@@ -82,8 +83,11 @@ function deriveImportTitle(files: File[], mode: ExtractionMode, prompt: string |
  * cards should be shaped (prompt mode, always wired — see
  * preprocessWorker.ts's custom_prompt threading). A prompt with NO source
  * attached also works — cards are generated entirely from the model's own
- * knowledge, grounded by the prompt (see createPromptOnlyImport). YouTube
- * and Anki import remain honest UI-only stubs until their backends exist.
+ * knowledge, grounded by the prompt (see createPromptOnlyImport). A YouTube
+ * link is real too — its transcript (fetched via fetch-youtube-transcript,
+ * see startYoutubeImport) is wrapped as a synthetic .txt file and sent
+ * through the exact same doc-upload pipeline as an attached text file.
+ * Anki import remains an honest UI-only stub until its backend exists.
  */
 export function renderImportContent(container: HTMLElement, deps: ImportContentDeps): void {
   const { deckId } = deps;
@@ -146,7 +150,11 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
 
   function canSend(): boolean {
     if (busy) return false;
-    if (youtubeUrl.trim()) return true;
+    if (youtubeUrl.trim()) {
+      // Same rule as an attached file: prompt mode needs a prompt describing
+      // how to shape the cards; faithful mode just needs the link itself.
+      return extractionMode === 'faithful' || promptText.trim().length > 0;
+    }
     if (extractionMode === 'faithful') return attachedFiles.length > 0;
     // prompt mode: a prompt is required whenever anything's attached; a
     // prompt with no source at all is the honest "coming soon" stub path,
@@ -176,7 +184,7 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
                    ${allChips ? `<div class="composer-attachments">${allChips}</div>` : ''}
                    <textarea id="promptTextarea" class="composer-textarea" rows="2" placeholder="Describe the cards you want — e.g. &quot;make vocabulary flashcards from this&quot;." ${busy ? 'disabled' : ''}>${esc(promptText)}</textarea>
                    <div class="composer-toolbar">
-                     <span class="composer-toolbar-hint">${attachedFiles.length && !promptText.trim() ? 'Add a prompt describing how to shape these cards' : ''}</span>
+                     <span class="composer-toolbar-hint">${(attachedFiles.length || youtubeUrl.trim()) && !promptText.trim() ? 'Add a prompt describing how to shape these cards' : ''}</span>
                      <button type="button" class="composer-send-btn" id="composerSendBtn" ${canSend() ? '' : 'disabled'} title="Create">${busy ? '…' : '➤'}</button>
                    </div>
                  </div>
@@ -193,7 +201,7 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
               (p) =>
                 `<button type="button" class="source-pill" data-source-kind="${p.kind}" ${busy || (locked && locked !== p.kind) ? 'disabled' : ''} title="${locked && locked !== p.kind ? 'Remove attached files to switch source type' : `Attach ${p.label.toLowerCase()} — an import can only hold one source type`}">${p.icon} ${esc(p.label)}</button>`,
             ).join('')}
-            <button type="button" class="source-pill source-pill-stub" id="youtubePillBtn" ${busy ? 'disabled' : ''} title="Coming soon">▶️ YouTube link</button>
+            <button type="button" class="source-pill" id="youtubePillBtn" ${busy ? 'disabled' : ''} title="Attach a YouTube link — its transcript is fetched automatically">▶️ YouTube link</button>
             ${
               extractionMode === 'faithful'
                 ? `<button type="button" class="source-pill source-pill-optional" id="attachCorrigeBtn" ${busy ? 'disabled' : ''} title="Optional — gives exercises real, checkable answers instead of the usual read-only Verify placeholder">📋 Answer key <span class="opt">optional</span></button>`
@@ -358,12 +366,15 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
    * page's extraction (see preprocessWorker.ts). A prompt with no source at
    * all is also real (see createPromptOnlyImport/startPromptOnlyImport) —
    * cards generated entirely from the model's own knowledge, grounded by
-   * the prompt. Only YouTube and Anki import remain honest UI-only stubs.
+   * the prompt. A YouTube link is real too, via startYoutubeImport below —
+   * only Anki import remains an honest UI-only stub.
    */
   async function handleComposerSend(): Promise<void> {
     if (busy) return;
     if (youtubeUrl.trim()) {
-      toast('YouTube import isn’t wired up yet — coming soon.');
+      const prompt = extractionMode === 'prompt' ? promptText.trim() : undefined;
+      if (extractionMode === 'prompt' && !prompt) return; // guarded by canSend()/disabled send button already
+      await startYoutubeImport(youtubeUrl.trim(), prompt, extractionMode === 'faithful' ? corrigeFile : null);
       return;
     }
     if (!attachedFiles.length) {
@@ -373,6 +384,35 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
     const prompt = extractionMode === 'prompt' ? promptText.trim() : undefined;
     if (extractionMode === 'prompt' && !prompt) return; // guarded by canSend()/disabled send button already
     await startSourceImport(attachedFiles, prompt, extractionMode === 'faithful' ? corrigeFile : null);
+  }
+
+  /**
+   * A YouTube link: fetch its transcript (fetch-youtube-transcript, backed
+   * by transcriptapi.com), wrap it as a synthetic .txt File, then hand off
+   * to startSourceImport exactly as if the learner had attached a real text
+   * file — same upload/preprocess/extract pipeline, no separate code path.
+   * The extra step here is only the transcript fetch itself, which needs
+   * its own busy/error handling since it happens before startSourceImport's.
+   */
+  async function startYoutubeImport(url: string, customPrompt: string | undefined, corrige: File | null): Promise<void> {
+    startError = null;
+    busy = true;
+    render();
+    let transcript: string;
+    let title: string;
+    try {
+      const result = await fetchYoutubeTranscript(url);
+      transcript = result.transcript;
+      title = result.title;
+    } catch (e) {
+      startError = 'Could not fetch this video’s transcript: ' + errMsg(e);
+      busy = false;
+      render();
+      return;
+    }
+    const safeTitle = title.replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, MAX_TITLE_LEN) || 'youtube-transcript';
+    const file = new File([transcript], `${safeTitle}.txt`, { type: 'text/plain' });
+    await startSourceImport([file], customPrompt, corrige);
   }
 
   /** No file at all — cards generated purely from the prompt (see createPromptOnlyImport). Skips file upload/preprocessing entirely; the import lands directly in the extraction stage. */
