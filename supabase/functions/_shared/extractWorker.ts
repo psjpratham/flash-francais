@@ -28,18 +28,25 @@ import { formatNumberedLines, toSourceLines, type SourceLine } from './sourceLin
 import { validatePage, type ValidatedBlock } from './blockValidation.ts';
 import { checkCoverage, coverageHasIssues, type CoverageResult } from './coverage.ts';
 
-// Was 6000 — verified directly that this let a single chunk (a 214-line
-// YouTube-transcript slice under an exhaustive "card for every phrase"
-// prompt) demand ~214 generated blocks in one call, hitting Gemini's
-// per-call timeout and, worse, letting a sequential multi-chunk page blow
-// past Supabase's platform wall-clock ceiling with the function killed
-// mid-flight (no graceful error — the job just sits stuck in 'processing'
-// forever). Smaller chunks bound how much any single call has to produce,
-// keeping calls fast regardless of how content-dense/exhaustive the source
-// or prompt is; ordinary textbook pages (a handful of exercises) are
-// unaffected either way. See the chunk-loop time budget below for the
-// other half of this fix.
-const MAX_CHARS_PER_REQUEST = 2000;
+// Chunking exists ONLY as a last-resort ceiling for genuinely huge sources
+// now, not the normal operating mode — it was previously the primary lever
+// for bounding a call's output size (smaller input -> presumably smaller
+// necessary output), which is an indirect, imprecise proxy for the thing
+// that actually matters. maxBlocksHint/GLOBAL_MAX_BLOCKS_PER_PAGE below is
+// the DIRECT control on output size, and generation latency is driven by
+// output tokens, not input tokens (an LLM reads input far faster than it
+// writes output) — so splitting a normal-sized source into several chunks
+// doesn't make any one call meaningfully faster, it just multiplies how
+// many sequential calls (each with its own audit/repair/polish pass) a
+// page needs. Verified directly: a 14-minute YouTube transcript (~5,300
+// chars) was splitting into 3 sequential chunks under the old 2000-char
+// limit even for a "just give me 10 cards" prompt — 3x the round-trips for
+// no benefit, since maxBlocksHint already bounds each call's output
+// regardless of how much source text surrounds it. 24000 keeps almost any
+// realistic single video/textbook page in ONE chunk/ONE call; only a
+// genuinely enormous source still splits, as a safety fallback, not the
+// common case.
+const MAX_CHARS_PER_REQUEST = 24_000;
 const MAX_REPAIR_ATTEMPTS = 2;
 const JOB_TIME_BUDGET_MS = 150_000;
 // Hard ceiling on the extraction chunk loop alone (runFullExtraction),
