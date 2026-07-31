@@ -72,6 +72,36 @@ export function confirmDialog(message: string, confirmLabel = 'Yes', cancelLabel
   });
 }
 
+/** Non-blocking replacement for window.prompt — same rationale as confirmDialog above. Resolves the trimmed input, or null if cancelled/closed with nothing changed. */
+export function promptDialog(title: string, defaultValue = '', confirmLabel = 'Save', cancelLabel = 'Cancel'): Promise<string | null> {
+  return new Promise((resolve) => {
+    let result: string | null = null;
+    const { box, close } = openModal(
+      `<h3>${esc(title)}</h3>
+      <div class="field"><input id="promptDialogInput" value="${esc(defaultValue)}"></div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn-sec" id="promptDialogCancel">${esc(cancelLabel)}</button>
+        <button class="btn-primary" style="width:auto" id="promptDialogOk">${esc(confirmLabel)}</button>
+      </div>`,
+      () => resolve(result),
+    );
+    const input = box.querySelector<HTMLInputElement>('#promptDialogInput')!;
+    input.focus();
+    input.select();
+    const submit = (): void => {
+      const v = input.value.trim();
+      if (!v) return;
+      result = v;
+      close();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit();
+    });
+    box.querySelector('#promptDialogOk')?.addEventListener('click', submit);
+    box.querySelector('#promptDialogCancel')?.addEventListener('click', close);
+  });
+}
+
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function toast(message: string): void {

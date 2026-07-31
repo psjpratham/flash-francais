@@ -30,6 +30,7 @@ function block(content: unknown, sourceText = 'fallback source text'): PageBlock
     needs_review: false,
     review_reason: null,
     show_source_in_practice: true,
+    show_source_in_study: true,
     note_type: null,
     fields: null,
     review_status: null,

@@ -1,21 +1,13 @@
 import { computeImportDiagnostics, type ImportDiagnostics } from '../lib/importDiagnostics';
-import {
-  deleteImportAudioFile,
-  getImportById,
-  hasActivePreprocessJob,
-  listImportAudioFiles,
-  resumePreprocessing,
-  retryFailedPreprocessingPages,
-  uploadImportAudioFile,
-} from '../lib/imports';
+import { getImportById, hasActivePreprocessJob, resumePreprocessing, retryFailedPreprocessingPages } from '../lib/imports';
 import { startImportPolling } from '../lib/importPolling';
-import { isTerminal, type TextbookImportProgress } from '../lib/importProgress';
+import { computeTextbookImportProgress, isTerminal, STAGE, type TextbookImportProgress } from '../lib/importProgress';
 import { hasAnyPageExtractions, requeueStaleExtractionJobs, retryFailedExtractionJobs, retryOneExtractionJob } from '../lib/pageExtractions';
 import { renderPendingPageImages } from '../lib/pageRender';
-import type { Import, ImportAudioFile } from '../types';
+import type { Import } from '../types';
 import { $, errMsg, esc, toast } from '../lib/dom';
 import { renderImportProgress } from './importProgressView';
-import { renderAdminDiagnostics } from './adminDiagnosticsView';
+import { renderAdminJobsTable, renderImportDetailsSummary } from './adminDiagnosticsView';
 
 export interface ImportDetailDeps {
   onBack: () => void;
@@ -23,6 +15,7 @@ export interface ImportDetailDeps {
   deckId: string;
   deckName: string;
   importId: string;
+  /** Gates only the extra model/token/cost deep-dive (renderAdminJobsTable) + "Requeue stale jobs"/"Copy diagnostics JSON" — the plain-language details summary and every self-service retry/resume action are available to any owner, admin or not. */
   isAdmin: boolean;
 }
 
@@ -43,10 +36,8 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
   let loadError: string | null = null;
   let pagesReady = false;
 
-  let audioFiles: ImportAudioFile[] = [];
-  let audioBusy = false;
-
-  let showDiagnostics = false;
+  /** Toggles the "Details" panel — visible to any owner; deps.isAdmin only adds the extra model/token table inside it once open. */
+  let showDetails = false;
   let diagnostics: ImportDiagnostics | null = null;
   let diagBusy = false;
   let diagError: string | null = null;
@@ -65,7 +56,6 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
       render();
       return;
     }
-    await loadAudioFiles();
     pagesReady = await hasAnyPageExtractions(deps.importId).catch(() => false);
     hasActiveJob = await hasActivePreprocessJob(deps.importId).catch(() => false);
     stopPolling = startImportPolling(deps.importId, onProgress);
@@ -81,7 +71,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
   async function onProgress(p: TextbookImportProgress): Promise<void> {
     progress = p;
     pagesReady = pagesReady || (await hasAnyPageExtractions(deps.importId).catch(() => pagesReady));
-    if (p.currentStage === 'Reading pages') {
+    if (p.currentStage === STAGE.READING) {
       hasActiveJob = await hasActivePreprocessJob(deps.importId).catch(() => hasActiveJob);
     }
     render();
@@ -133,43 +123,7 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
     }
   }
 
-  // ---------- generic audio uploads ----------
-
-  async function loadAudioFiles(): Promise<void> {
-    try {
-      audioFiles = await listImportAudioFiles(deps.importId);
-    } catch (e) {
-      toast('Could not load audio files: ' + errMsg(e));
-    }
-    render();
-  }
-
-  async function uploadAudioFiles(files: FileList): Promise<void> {
-    if (audioBusy) return;
-    audioBusy = true;
-    render();
-    for (const file of Array.from(files)) {
-      try {
-        await uploadImportAudioFile(deps.importId, file);
-      } catch (e) {
-        toast(`Could not upload ${file.name}: ${errMsg(e)}`);
-      }
-    }
-    audioBusy = false;
-    await loadAudioFiles();
-  }
-
-  async function removeAudioFile(audioFile: ImportAudioFile): Promise<void> {
-    try {
-      await deleteImportAudioFile(audioFile);
-      audioFiles = audioFiles.filter((a) => a.id !== audioFile.id);
-      render();
-    } catch (e) {
-      toast('Could not remove audio file: ' + errMsg(e));
-    }
-  }
-
-  // ---------- admin diagnostics + retry controls ----------
+  // ---------- details panel + retry controls ----------
 
   async function loadDiagnostics(): Promise<void> {
     diagError = null;
@@ -181,12 +135,13 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
     render();
   }
 
-  async function toggleDiagnostics(): Promise<void> {
-    showDiagnostics = !showDiagnostics;
+  async function toggleDetails(): Promise<void> {
+    showDetails = !showDetails;
     render();
-    if (showDiagnostics && !diagnostics) await loadDiagnostics();
+    if (showDetails && !diagnostics) await loadDiagnostics();
   }
 
+  /** Self-service — any owner can retry their own failed extraction pages, not just admins. Refreshes `progress` (so the button's own visibility count is current) and, if the Details panel happens to be open, the fuller diagnostics too. */
   async function runRetryAllFailed(): Promise<void> {
     if (diagBusy) return;
     diagBusy = true;
@@ -194,7 +149,8 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
     try {
       const n = await retryFailedExtractionJobs(deps.importId);
       toast(n > 0 ? `Requeued ${n} failed page(s)` : 'No failed pages to retry');
-      await loadDiagnostics();
+      progress = await computeTextbookImportProgress(deps.importId);
+      if (diagnostics) await loadDiagnostics();
     } catch (e) {
       toast('Could not retry failed pages: ' + errMsg(e));
     } finally {
@@ -244,23 +200,22 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
     }
   }
 
-  function renderDiagnosticsSection(): string {
-    if (!deps.isAdmin) return '';
+  function renderDetailsSection(): string {
     return `
       <div class="panelbox">
-        <button class="more-toggle" id="toggleDiagBtn">${showDiagnostics ? '− Hide admin details' : '+ Admin details'}</button>
+        <button class="more-toggle" id="toggleDetailsBtn">${showDetails ? '− Hide details' : '+ Details'}</button>
         ${
-          showDiagnostics
+          showDetails
             ? `<div style="margin-top:12px">
                  ${diagError ? `<div class="auth-err">${esc(diagError)}</div>` : ''}
                  <div class="row" style="margin-bottom:12px">
                    <button class="btn-sec" id="refreshDiagBtn" ${diagBusy ? 'disabled' : ''}>🔄 Refresh status</button>
-                   <button class="btn-sec" id="retryOneFailedBtn" ${diagBusy ? 'disabled' : ''}>Retry all failed extraction pages</button>
-                   <button class="btn-sec" id="requeueStaleBtn" ${diagBusy ? 'disabled' : ''}>Requeue stale jobs</button>
-                   <button class="btn-sec" id="copyDiagBtn">Copy safe diagnostics JSON</button>
                    ${pagesReady ? `<button class="btn-sec" id="diagOpenReviewBtn">📄 Open page review</button>` : ''}
+                   ${deps.isAdmin ? `<button class="btn-sec" id="requeueStaleBtn" ${diagBusy ? 'disabled' : ''}>Requeue stale jobs</button>` : ''}
+                   ${deps.isAdmin ? `<button class="btn-sec" id="copyDiagBtn">Copy admin diagnostics JSON</button>` : ''}
                  </div>
-                 ${diagnostics ? renderAdminDiagnostics(diagnostics) : `<p class="p-text">Loading diagnostics…</p>`}
+                 ${diagnostics ? renderImportDetailsSummary(diagnostics) : `<p class="p-text">Loading details…</p>`}
+                 ${deps.isAdmin && diagnostics ? renderAdminJobsTable(diagnostics) : ''}
                </div>`
             : ''
         }
@@ -268,51 +223,16 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
   }
 
   function wireDiagnostics(): void {
-    document.getElementById('toggleDiagBtn')?.addEventListener('click', () => void toggleDiagnostics());
+    document.getElementById('toggleDetailsBtn')?.addEventListener('click', () => void toggleDetails());
     document.getElementById('refreshDiagBtn')?.addEventListener('click', () => {
       void refreshNow();
       void loadDiagnostics();
     });
-    document.getElementById('retryOneFailedBtn')?.addEventListener('click', () => void runRetryAllFailed());
+    document.getElementById('diagOpenReviewBtn')?.addEventListener('click', () => deps.onOpenPageReview(deps.importId));
     document.getElementById('requeueStaleBtn')?.addEventListener('click', () => void runRequeueStale());
     document.getElementById('copyDiagBtn')?.addEventListener('click', () => void copyDiagnostics());
-    document.getElementById('diagOpenReviewBtn')?.addEventListener('click', () => deps.onOpenPageReview(deps.importId));
     document.querySelectorAll<HTMLButtonElement>('[data-retry-job]').forEach((btn) => {
       btn.addEventListener('click', () => void runRetryOneJob(btn.dataset.retryJob!));
-    });
-  }
-
-  // ---------- audio section ----------
-
-  function renderAudioSection(): string {
-    return `
-      <div class="panelbox">
-        <h3>Audio files <span style="font-weight:400;color:var(--ink-faint);font-size:12.5px">(optional — mp3/wav/m4a, matched to audio references detected on each page)</span></h3>
-        ${
-          audioFiles.length
-            ? `<div class="import-file-row-list">${audioFiles
-                .map(
-                  (a) => `
-              <div class="import-file-row">
-                <span class="import-file-name">${esc(a.original_filename)}${a.track_number != null ? ` — track ${a.track_number}` : ''}</span>
-                <button class="btn-sec" data-remove-audio="${esc(a.id)}">Remove</button>
-              </div>`,
-                )
-                .join('')}</div>`
-            : `<p class="p-text">No audio files uploaded yet.</p>`
-        }
-        <input type="file" id="audioFileInput" accept="audio/mpeg,audio/wav,audio/mp4,audio/m4a,.mp3,.wav,.m4a" multiple ${audioBusy ? 'disabled' : ''}>
-      </div>`;
-  }
-
-  function wireAudioSection(): void {
-    document.getElementById('audioFileInput')?.addEventListener('change', (ev) => {
-      const files = (ev.target as HTMLInputElement).files;
-      if (files?.length) void uploadAudioFiles(files);
-    });
-    document.querySelectorAll<HTMLButtonElement>('[data-remove-audio]').forEach((btn) => {
-      const audioFile = audioFiles.find((a) => a.id === btn.dataset.removeAudio);
-      if (audioFile) btn.addEventListener('click', () => void removeAudioFile(audioFile));
     });
   }
 
@@ -349,13 +269,15 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
 
     const showOpenReview = pagesReady;
     const preprocessingUnfinished = imp.status === 'uploaded' || imp.status === 'preprocessing' || (imp.status === 'failed' && !!imp.preprocessing_error);
-    const showResume = deps.isAdmin && preprocessingUnfinished && !hasActiveJob;
-    const showRetryFailedPages = deps.isAdmin && imp.pages_failed_preprocessing > 0 && !hasActiveJob;
+    const showResume = preprocessingUnfinished && !hasActiveJob;
+    const showRetryFailedPages = imp.pages_failed_preprocessing > 0 && !hasActiveJob;
+    const failedExtractionCount = progress.reviewCounts?.failed ?? 0;
+    const showRetryFailedExtraction = failedExtractionCount > 0;
 
     el.innerHTML = `
       <div class="panelbox">
         <h3>Progress</h3>
-        ${renderImportProgress(progress)}
+        ${renderImportProgress(progress, { compact: true })}
         ${
           preprocessingUnfinished && !hasActiveJob
             ? `<div class="auth-err">⚠ No preprocessing worker is currently active for this import.</div>`
@@ -366,17 +288,17 @@ export function renderImportDetail(container: HTMLElement, deps: ImportDetailDep
           <button class="btn-sec" id="refreshStatusBtn" ${preprocessBusy ? 'disabled' : ''}>🔄 Refresh status</button>
           ${showResume ? `<button class="btn-sec" id="resumePreprocessBtn" ${preprocessBusy ? 'disabled' : ''}>▶ Resume preprocessing</button>` : ''}
           ${showRetryFailedPages ? `<button class="btn-sec" id="retryFailedPagesBtn" ${preprocessBusy ? 'disabled' : ''}>Retry failed pages (${imp.pages_failed_preprocessing})</button>` : ''}
+          ${showRetryFailedExtraction ? `<button class="btn-sec" id="retryFailedExtractionBtn" ${diagBusy ? 'disabled' : ''}>Retry failed extraction (${failedExtractionCount})</button>` : ''}
           ${showOpenReview ? `<button class="btn-sec" id="openReviewBtn">📄 Open page review</button>` : ''}
         </div>
       </div>
-      ${renderAudioSection()}
-      ${renderDiagnosticsSection()}`;
+      ${renderDetailsSection()}`;
 
     document.getElementById('openReviewBtn')?.addEventListener('click', () => deps.onOpenPageReview(deps.importId));
     document.getElementById('refreshStatusBtn')?.addEventListener('click', () => void refreshNow());
     document.getElementById('resumePreprocessBtn')?.addEventListener('click', () => void runResumePreprocessing());
     document.getElementById('retryFailedPagesBtn')?.addEventListener('click', () => void runRetryFailedPreprocessingPages());
-    wireAudioSection();
+    document.getElementById('retryFailedExtractionBtn')?.addEventListener('click', () => void runRetryAllFailed());
     wireDiagnostics();
   }
 

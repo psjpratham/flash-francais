@@ -15,8 +15,9 @@ import { $, confirmDialog, errMsg, esc } from '../lib/dom';
 
 const STUDY_ANSWER_SAVE_DEBOUNCE_MS = 400;
 
+/** Only a generation-mode 'flashcard'-recipe card gets the pure flip UI (see flashcardFace) — a faithful extraction that merely happens to use the flashcard recipe (e.g. a vocabulary card) has nothing invented to hide behind a flip, and needs importedFace's source-image handling, same distinction session.ts's isFlashcard already makes. */
 function isFlashcardCard(card: CardWithNote): boolean {
-  return card.origin === 'textbook_extraction' && card.component_type === 'flashcard';
+  return card.origin === 'textbook_extraction' && card.prompt_generated && card.component_type === 'flashcard';
 }
 
 export interface StudyModeDeps {
@@ -135,22 +136,22 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
     renderControls();
   }
 
-  /** Page-stack cards render read-only (nothing to guess, so nothing to flip) in the same split page-image view the review UI and practice session both use — studying one reads exactly like reviewing it. The source pane only shows when this card's own "show source in practice" toggle is on. */
+  /** Page-stack cards render read-only (nothing to guess, so nothing to flip) in the same split page-image view the review UI and practice session both use — studying one reads exactly like reviewing it. The source pane only shows when this card's own "show source in study mode" toggle is on — independent of its Practice-mode counterpart. */
   function importedFace(card: CardWithNote): string {
     const content = `<div class="session-imported-left" data-read-block-id="${esc(card.id)}">${renderReadModeBlock(card, new Map(), true)}</div>`;
-    if (!card.show_source_in_practice) {
+    const imagePath = card.import_pages?.rendered_page_path ?? null;
+    const imageUrl = card.show_source_in_study && imagePath ? pageImageUrls.get(imagePath) : null;
+    if (!imageUrl) {
       return `<div class="panelbox" style="padding:0;overflow:hidden">
         <div class="session-imported-split session-imported-solo" style="min-height:480px">${content}</div>
       </div>`;
     }
-    const imagePath = card.import_pages?.rendered_page_path ?? null;
-    const imageUrl = imagePath ? pageImageUrls.get(imagePath) : null;
     return `
       <div class="panelbox" style="padding:0;overflow:hidden">
         <div class="session-imported-split" style="min-height:480px">
           ${content}
           <div class="session-imported-right">
-            ${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original source">` : '<div class="p-text">Source image not available.</div>'}
+            <img src="${esc(imageUrl)}" alt="Original source">
           </div>
         </div>
       </div>`;
@@ -170,6 +171,15 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
       </div>`;
   }
 
+  /** A generated card's source page image, when its own "show source in study mode" toggle is on — rendered as a panel beside the flip card (see session-study-row/session-source-pane, shared with Practice mode's own version of this), never inside the flipping element itself. Null when the toggle is off or there's no image (yet). */
+  function sourceImagePaneHTML(card: CardWithNote): string | null {
+    if (!card.show_source_in_study) return null;
+    const imagePath = card.import_pages?.rendered_page_path ?? null;
+    const imageUrl = imagePath ? pageImageUrls.get(imagePath) : null;
+    if (!imageUrl) return null;
+    return `<div class="session-source-pane"><img src="${esc(imageUrl)}" alt="Original source"></div>`;
+  }
+
   /** A 'flashcard'-recipe card — same tap-to-flip mental model as every other card here and Practice mode, front first. The back shows its rich detail (examples especially) directly, never gated behind a further click. */
   function flashcardFace(card: CardWithNote): string {
     const content = card.content as CardFlashcardContent;
@@ -177,13 +187,15 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
     const back = content.back ?? '—';
     const ipa = content.detail?.ipa;
     const detailHTML = renderFlashcardDetailHTML(content.detail);
-    return `
+    const cardZoneHTML = `
       <div class="zone" id="studyFlashcardZone">
         <div class="card pf-card-tall ${flipped ? 'flipped' : ''}" id="studyFlashcard">
           <div class="face front"><div class="center"><div class="word">${esc(front)}${pronIconHTML(front)}</div>${ipa ? `<div class="pf-ipa">/${esc(ipa)}/</div>` : ''}<div class="prompt"><i class="pulse"></i> Tap to reveal</div></div></div>
           <div class="face back pf-rich"><div class="center" style="flex:none"><div class="word small">${esc(front)}</div><div class="gloss">${esc(back)}</div></div>${detailHTML}</div>
         </div>
       </div>`;
+    const imagePane = sourceImagePaneHTML(card);
+    return imagePane ? `<div class="session-study-row">${cardZoneHTML}${imagePane}</div>` : cardZoneHTML;
   }
 
   function cardHTML(card: CardWithNote): string {

@@ -203,6 +203,11 @@ export async function listCardTagsForDeck(deckId: string): Promise<StackCardTags
   return (data ?? []).map((c) => ({ stackId: c.stack_id, tags: c.tags ?? [] }));
 }
 
+export async function renameStack(stackId: string, name: string): Promise<void> {
+  const { error } = await supabase.from('stacks').update({ name }).eq('id', stackId);
+  if (error) throw error;
+}
+
 export interface StackDetail {
   id: string;
   name: string;

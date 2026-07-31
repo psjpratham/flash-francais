@@ -12,7 +12,9 @@ import {
   requeuePageExtraction,
   sendPageBlocksToPractice,
   setCardIncludeInPractice,
-  setCardShowSourceInPractice,
+  setCardShowSource,
+  setPageBlocksShowSource,
+  type SourceVisibilityField,
   updatePageBlock,
 } from '../lib/pageExtractions';
 import { getRenderedPageUrl, renderPendingPageImages } from '../lib/pageRender';
@@ -198,6 +200,25 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     }
   }
 
+  /** Bulk version of doToggleShowSource — sets the given field for every current block on this page in one shot, one pair of buttons for Practice and one for Study. */
+  async function doSetShowSourceAll(field: SourceVisibilityField, show: boolean): Promise<void> {
+    const page = currentPage();
+    if (!page || busy) return;
+    busy = true;
+    render();
+    try {
+      const result = await setPageBlocksShowSource(page.id, field, show);
+      blocks = await listCardsForSourcePage(page.id);
+      const modeLabel = field === 'show_source_in_practice' ? 'Practice' : 'Study';
+      toast(result.updated ? `${show ? 'Showing' : 'Hiding'} source in ${modeLabel} for ${result.updated} card(s).` : show ? `Already showing source in ${modeLabel} for all.` : `Source already hidden in ${modeLabel} for all.`);
+    } catch (e) {
+      toast('Could not update: ' + errMsg(e));
+    } finally {
+      busy = false;
+      render();
+    }
+  }
+
   /** Per-card practice toggle — the primary way to include/exclude a card, independent of page approval status. */
   async function doTogglePractice(blockId: string, checked: boolean): Promise<void> {
     const block = blocks.find((b) => b.id === blockId);
@@ -212,10 +233,10 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     }
   }
 
-  /** Per-card toggle: whether Study/Practice shows this card's source image alongside it. */
-  async function doToggleShowSource(blockId: string, checked: boolean): Promise<void> {
+  /** Per-card toggle: whether Practice or Study mode shows this card's source image alongside it — the two are independent (see SourceVisibilityField). */
+  async function doToggleShowSource(blockId: string, field: SourceVisibilityField, checked: boolean): Promise<void> {
     try {
-      const updated = await setCardShowSourceInPractice(blockId, checked);
+      const updated = await setCardShowSource(blockId, field, checked);
       blocks = blocks.map((b) => (b.id === blockId ? updated : b));
       render();
     } catch (e) {
@@ -398,12 +419,26 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
         <button class="back-link" id="backBtn">← Stacks</button>
         <div class="page-h">
           <h1>📘 ${esc(importTitle)}</h1>
-          <p>${pages.length > 1 ? `Page ${pageCursor + 1} of ${pages.length}` : 'Page review'}</p>
+          <p>${pages.length > 1 ? `${pages.length} pages` : 'Single-page import'}</p>
         </div>
         ${body}
       </div>`;
     $(container, '#backBtn').addEventListener('click', deps.onBack);
     if (pages.length) wireBody();
+  }
+
+  /** Prev/Next + jump strip across THIS import's own pages (e.g. a multi-page PDF) — nothing to do with the Stacks browser's stacks. Omitted entirely for a single-page import, where there's nothing to navigate. */
+  function renderPageNav(): string {
+    if (pages.length <= 1) return '';
+    return `
+      <div class="page-nav">
+        <button class="btn-sec" id="prevPageBtn" ${pageCursor === 0 ? 'disabled' : ''}>← Prev page</button>
+        <div class="page-nav-strip">
+          <span class="page-nav-label">Page ${pageCursor + 1} of ${pages.length}</span>
+          <div class="page-nav-dots">${pages.map((p, i) => `<button class="page-thumb ${i === pageCursor ? 'on' : ''}" data-goto="${i}" title="Page ${p.displayed_page_number ?? i + 1}">${p.displayed_page_number ?? i + 1}</button>`).join('')}</div>
+        </div>
+        <button class="btn-sec" id="nextPageBtn" ${pageCursor === pages.length - 1 ? 'disabled' : ''}>Next page →</button>
+      </div>`;
   }
 
   function renderBody(): string {
@@ -418,13 +453,34 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
       : sentToPracticeCount > 0
         ? `Include all for practice (${sentToPracticeCount}/${blocks.length} included)`
         : 'Include all for practice';
+    const removeFromPracticeLabel = `Remove all${sentToPracticeCount > 0 ? ` (${sentToPracticeCount})` : ''}`;
+
+    const shownInPracticeCount = blocks.filter((b) => b.show_source_in_practice).length;
+    const allSourceShownInPractice = blocks.length > 0 && shownInPracticeCount >= blocks.length;
+    const allSourceHiddenInPractice = blocks.length > 0 && shownInPracticeCount === 0;
+    const canShowSourceAllInPractice = !busy && blocks.length > 0 && !allSourceShownInPractice;
+    const canHideSourceAllInPractice = !busy && shownInPracticeCount > 0;
+    const showSourceInPracticeLabel = allSourceShownInPractice
+      ? `✓ Shown for all (${shownInPracticeCount}/${blocks.length})`
+      : shownInPracticeCount > 0
+        ? `Show for all (${shownInPracticeCount}/${blocks.length})`
+        : 'Show for all';
+    const hideSourceInPracticeLabel = allSourceHiddenInPractice ? `✓ Hidden for all` : `Hide for all${shownInPracticeCount > 0 ? ` (${shownInPracticeCount})` : ''}`;
+
+    const shownInStudyCount = blocks.filter((b) => b.show_source_in_study).length;
+    const allSourceShownInStudy = blocks.length > 0 && shownInStudyCount >= blocks.length;
+    const allSourceHiddenInStudy = blocks.length > 0 && shownInStudyCount === 0;
+    const canShowSourceAllInStudy = !busy && blocks.length > 0 && !allSourceShownInStudy;
+    const canHideSourceAllInStudy = !busy && shownInStudyCount > 0;
+    const showSourceInStudyLabel = allSourceShownInStudy
+      ? `✓ Shown for all (${shownInStudyCount}/${blocks.length})`
+      : shownInStudyCount > 0
+        ? `Show for all (${shownInStudyCount}/${blocks.length})`
+        : 'Show for all';
+    const hideSourceInStudyLabel = allSourceHiddenInStudy ? `✓ Hidden for all` : `Hide for all${shownInStudyCount > 0 ? ` (${shownInStudyCount})` : ''}`;
 
     return `
-      <div class="stack-nav">
-        <button class="btn-sec" id="prevPageBtn" ${pageCursor === 0 ? 'disabled' : ''}>← Prev stack</button>
-        <div class="stack-nav-strip">${pages.map((p, i) => `<button class="page-thumb ${i === pageCursor ? 'on' : ''}" data-goto="${i}" title="Page ${p.displayed_page_number ?? i + 1}">${p.displayed_page_number ?? i + 1}</button>`).join('')}</div>
-        <button class="btn-sec" id="nextPageBtn" ${pageCursor === pages.length - 1 ? 'disabled' : ''}>Next stack →</button>
-      </div>
+      ${renderPageNav()}
       <div class="page-review-toolbar">
         ${unresolvedCount > 0 ? `<span class="page-status-badge needs_review">${unresolvedCount} warning(s)</span>` : ''}
         <div class="page-review-actions">
@@ -445,8 +501,28 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
                 : ''
             }
           </div>
-          <button class="btn-primary" style="width:auto" id="sendToPracticeBtn" ${canSendToPractice && !allSent ? '' : 'disabled'}>${esc(sendToPracticeLabel)}</button>
-          <button class="btn-sec" id="removeFromPracticeBtn" ${canRemoveFromPractice ? '' : 'disabled'}>Remove all from practice${sentToPracticeCount > 0 ? ` (${sentToPracticeCount})` : ''}</button>
+        </div>
+      </div>
+      <div class="page-bulk-actions">
+        <div class="bulk-panel">
+          <div class="bulk-panel-head"><span class="bulk-panel-icon">📇</span>Practice inclusion</div>
+          <div class="bulk-panel-row">
+            <button class="btn-primary" style="width:auto" id="sendToPracticeBtn" ${canSendToPractice && !allSent ? '' : 'disabled'}>${esc(sendToPracticeLabel)}</button>
+            <button class="btn-sec" id="removeFromPracticeBtn" ${canRemoveFromPractice ? '' : 'disabled'}>${esc(removeFromPracticeLabel)}</button>
+          </div>
+        </div>
+        <div class="bulk-panel">
+          <div class="bulk-panel-head"><span class="bulk-panel-icon">🖼️</span>Source image</div>
+          <div class="bulk-panel-row">
+            <span class="bulk-panel-tag">📇 Practice</span>
+            <button class="btn-sec" id="showSourceAllPracticeBtn" ${canShowSourceAllInPractice ? '' : 'disabled'}>${esc(showSourceInPracticeLabel)}</button>
+            <button class="btn-sec" id="hideSourceAllPracticeBtn" ${canHideSourceAllInPractice ? '' : 'disabled'}>${esc(hideSourceInPracticeLabel)}</button>
+          </div>
+          <div class="bulk-panel-row">
+            <span class="bulk-panel-tag">📖 Study</span>
+            <button class="btn-sec" id="showSourceAllStudyBtn" ${canShowSourceAllInStudy ? '' : 'disabled'}>${esc(showSourceInStudyLabel)}</button>
+            <button class="btn-sec" id="hideSourceAllStudyBtn" ${canHideSourceAllInStudy ? '' : 'disabled'}>${esc(hideSourceInStudyLabel)}</button>
+          </div>
         </div>
       </div>
       ${showSourceLines ? renderSourceLinesPanel(page) : ''}
@@ -500,22 +576,32 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
         <button class="btn-sec" data-delete="${esc(block.id)}" title="Delete this card">🗑 Delete</button>
         ${isFlashcardPreviewable ? `<button class="btn-sec" id="practicePreviewToggle">${practicePreviewOn ? '📄 Show both sides' : '👁 Preview as in Practice'}</button>` : ''}
       </div>
-      <div class="card-options-panel">
-        <h4>Card options</h4>
-        <label class="toggle-row">
-          <span>Include in practice</span>
-          <span class="toggle-switch"><input type="checkbox" data-toggle-practice="${esc(block.id)}" ${block.include_in_practice ? 'checked' : ''}><span class="toggle-slider"></span></span>
-        </label>
-        <label class="toggle-row">
-          <span>Show source in practice</span>
-          <span class="toggle-switch"><input type="checkbox" data-toggle-show-source="${esc(block.id)}" ${block.show_source_in_practice ? 'checked' : ''}><span class="toggle-slider"></span></span>
-        </label>
-      </div>
       ${
         isFlashcardPreviewable && practicePreviewOn
           ? renderFlashcardPracticePreview(block)
           : `<div class="page-read-content" data-read-block-id="${esc(block.id)}">${renderReadModeBlock(block, byId, true)}</div>`
-      }`;
+      }
+      <div class="card-options-panel">
+        <h4>Card options</h4>
+        <div class="card-options-group">
+          <div class="card-options-group-label">📇 Practice</div>
+          <label class="toggle-row">
+            <span>Include in practice</span>
+            <span class="toggle-switch"><input type="checkbox" data-toggle-practice="${esc(block.id)}" ${block.include_in_practice ? 'checked' : ''}><span class="toggle-slider"></span></span>
+          </label>
+          <label class="toggle-row">
+            <span>Show source image</span>
+            <span class="toggle-switch"><input type="checkbox" data-toggle-show-source-practice="${esc(block.id)}" ${block.show_source_in_practice ? 'checked' : ''}><span class="toggle-slider"></span></span>
+          </label>
+        </div>
+        <div class="card-options-group">
+          <div class="card-options-group-label">📖 Study</div>
+          <label class="toggle-row">
+            <span>Show source image</span>
+            <span class="toggle-switch"><input type="checkbox" data-toggle-show-source-study="${esc(block.id)}" ${block.show_source_in_study ? 'checked' : ''}><span class="toggle-slider"></span></span>
+          </label>
+        </div>
+      </div>`;
   }
 
   /** Same flip mechanic as Practice mode (session.ts): tap to reveal the back, nothing more — this is a preview, not a graded review, so there are no FSRS buttons. */
@@ -686,6 +772,10 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     document.getElementById('reExtractInstructionsBtn')?.addEventListener('click', () => void doReExtract(true));
     document.getElementById('sendToPracticeBtn')?.addEventListener('click', () => void doSendToPractice());
     document.getElementById('removeFromPracticeBtn')?.addEventListener('click', () => void doRemoveAllFromPractice());
+    document.getElementById('showSourceAllPracticeBtn')?.addEventListener('click', () => void doSetShowSourceAll('show_source_in_practice', true));
+    document.getElementById('hideSourceAllPracticeBtn')?.addEventListener('click', () => void doSetShowSourceAll('show_source_in_practice', false));
+    document.getElementById('showSourceAllStudyBtn')?.addEventListener('click', () => void doSetShowSourceAll('show_source_in_study', true));
+    document.getElementById('hideSourceAllStudyBtn')?.addEventListener('click', () => void doSetShowSourceAll('show_source_in_study', false));
     document.getElementById('zoomInBtn')?.addEventListener('click', () => {
       zoom = Math.min(3, zoom + 0.25);
       render();
@@ -717,8 +807,11 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     document.querySelectorAll<HTMLInputElement>('[data-toggle-practice]').forEach((cb) =>
       cb.addEventListener('change', () => void doTogglePractice(cb.dataset.togglePractice!, cb.checked)),
     );
-    document.querySelectorAll<HTMLInputElement>('[data-toggle-show-source]').forEach((cb) =>
-      cb.addEventListener('change', () => void doToggleShowSource(cb.dataset.toggleShowSource!, cb.checked)),
+    document.querySelectorAll<HTMLInputElement>('[data-toggle-show-source-practice]').forEach((cb) =>
+      cb.addEventListener('change', () => void doToggleShowSource(cb.dataset.toggleShowSourcePractice!, 'show_source_in_practice', cb.checked)),
+    );
+    document.querySelectorAll<HTMLInputElement>('[data-toggle-show-source-study]').forEach((cb) =>
+      cb.addEventListener('change', () => void doToggleShowSource(cb.dataset.toggleShowSourceStudy!, 'show_source_in_study', cb.checked)),
     );
 
     // The "add a brand-new block" form (raw kind/type/JSON — see

@@ -13,7 +13,7 @@ export interface ImportContentDeps {
   onImportCreated: (importId: string) => void;
   deckId: string;
   deckName: string;
-  /** Gates the source+prompt composer — creating an import row requires admin, same as RLS enforces server-side. */
+  /** Gates the "force image-only extraction" test-mode checkbox — a debug knob, not something regular users should see or toggle. */
   isAdmin: boolean;
 }
 
@@ -90,9 +90,9 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
   let mode: Mode = 'chooser';
   let busy = false;
   let startError: string | null = null;
-  let forceImageOnly = false;
+  let forceImageOnly = true;
 
-  let extractionMode: ExtractionMode = 'faithful';
+  let extractionMode: ExtractionMode = 'prompt';
   let promptText = '';
   let attachedFiles: File[] = [];
   // Faithful mode only — an optional answer key uploaded alongside the main
@@ -112,7 +112,7 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
         <button class="back-link" id="backBtn">← ${esc(deps.deckName)}</button>
         <div class="page-h">
           <h1>Import content</h1>
-          <p>Adds content to <strong>${esc(deps.deckName)}</strong>. This never creates another deck.</p>
+          <p>Adds content to <strong>${esc(deps.deckName)}</strong>.</p>
         </div>
         <div id="importBody"></div>
       </div>`;
@@ -162,9 +162,6 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
     const allChips = attachmentChips + youtubeChip + corrigeChip;
 
     return `
-      ${
-        deps.isAdmin
-          ? `
         <div class="composer-wrap">
           ${startError ? `<div class="auth-err" style="margin-bottom:10px">${esc(startError)}</div>` : ''}
 
@@ -214,19 +211,32 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
               : ''
           }
 
-          <label class="checkbox-field composer-advanced">
-            <input type="checkbox" id="forceImageOnlyCheckbox" ${forceImageOnly ? 'checked' : ''}>
-            Force image-only extraction (test mode)
-          </label>
+          ${
+            deps.isAdmin
+              ? `<label class="checkbox-field composer-advanced">
+                   <input type="checkbox" id="forceImageOnlyCheckbox" ${forceImageOnly ? 'checked' : ''}>
+                   Force image-only extraction (test mode)
+                 </label>`
+              : ''
+          }
+
+          ${
+            extractionMode === 'faithful'
+              ? `<div class="infocard composer-faithful-info">
+                   <strong>What "faithful extraction" means</strong>
+                   <p>Use this when your source <em>is</em> the material you want cards from — a textbook page, a worksheet, a set of activities — and you want the cards to mirror it exactly, not be reshaped or summarized by a prompt.</p>
+                   <p>Each exercise on the page becomes its own card, reproducing the original wording as written. Cards only get a real front/back/checkable answer if that exercise's answer is present — either printed on the page itself, or supplied separately as an attached answer key ("corrigé", optional above). Otherwise the card is read-only: it shows the exercise but has no answer to check against.</p>
+                   <p>If you'd rather describe how the cards should be shaped (e.g. "make vocabulary flashcards from this"), switch to <strong>Generate with a prompt</strong> instead.</p>
+                 </div>`
+              : ''
+          }
 
           ${
             extractionMode === 'faithful'
               ? `<button type="button" class="btn-primary composer-start-btn" id="composerSendBtn" ${canSend() ? '' : 'disabled'}>${busy ? 'Starting…' : 'Start faithful extraction →'}</button>`
               : ''
           }
-        </div>`
-          : ''
-      }
+        </div>
 
       <div class="composer-below-options">
         <button class="composer-option-btn" id="chooseJsonBtn"><span class="t">📄 Import from JSON</span></button>

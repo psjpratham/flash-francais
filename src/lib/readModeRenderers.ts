@@ -181,14 +181,16 @@ function renderCardInstruction(block: PageBlock, suppress: boolean): string {
 function renderVerifyArea(block: PageBlock): string {
   if (block.block_kind !== 'interaction') return '';
   const status: AnswerKeyStatus = block.answer_key_status ?? 'unknown';
-  const cfg: Record<AnswerKeyStatus, { label: string; disabled: boolean; note: string }> = {
-    available: { label: 'Verify', disabled: false, note: '' },
-    unavailable: { label: 'Verify — unavailable', disabled: true, note: 'No answer key available for this exercise yet.' },
-    unknown: { label: 'Verify — pending', disabled: true, note: 'Answer key status not yet determined.' },
+  const cfg: Record<AnswerKeyStatus, { label: string; disabled: boolean; note: string; cls: string }> = {
+    available: { label: 'Verify', disabled: false, note: '', cls: '' },
+    // Answered by the model itself, not confirmed by the real answer key — Verify still works, but is visibly marked so it's never mistaken for a key-confirmed answer.
+    inferred: { label: 'Verify (AI-answered)', disabled: false, note: 'Not from the answer key — the model’s own best judgment.', cls: 'read-verify-btn-inferred' },
+    unavailable: { label: 'Verify — unavailable', disabled: true, note: 'No answer key available for this exercise yet.', cls: '' },
+    unknown: { label: 'Verify — pending', disabled: true, note: 'Answer key status not yet determined.', cls: '' },
   };
   const s = cfg[status];
   return `<div class="read-verify-area">
-    <button type="button" class="btn-sec read-verify-btn" data-verify-block="${esc(block.id)}" ${s.disabled ? 'disabled' : ''}>${esc(s.label)}</button>
+    <button type="button" class="btn-sec read-verify-btn ${s.cls}" data-verify-block="${esc(block.id)}" ${s.disabled ? 'disabled' : ''}>${esc(s.label)}</button>
     ${s.note ? `<span class="read-verify-note">${esc(s.note)}</span>` : ''}
     <div class="read-feedback-area" data-feedback-area="${esc(block.id)}" hidden></div>
   </div>`;
@@ -311,7 +313,7 @@ function vocabularyBody(block: PageBlock): string {
       (p) => `<div class="read-vocab-entry">
         <div class="read-vocab-term-row">
           <span class="read-vocab-term">${esc(p.term)}</span>
-          ${pron ? '<button type="button" class="pron-icon" data-pron-play title="Play pronunciation">🔊</button>' : ''}
+          ${pron ? pronIconHTML(p.term) : ''}
           ${p.translation ? `<span class="read-vocab-translation">${esc(p.translation)}</span>` : ''}
         </div>
         ${p.example ? `<div class="read-vocab-example">${esc(p.example)}</div>` : ''}
@@ -413,7 +415,7 @@ function tableBody(block: PageBlock): string {
     return `<table class="p-tbl read-vocab-table">${content.pairs
       .map(
         (p) =>
-          `<tr><td class="read-vocab-term">${esc(p.term)}${pron ? ' <button type="button" class="pron-icon" data-pron-play title="Play pronunciation">🔊</button>' : ''}</td><td>${esc(p.translation ?? '')}</td></tr>`,
+          `<tr><td class="read-vocab-term">${esc(p.term)}${pron ? ' ' + pronIconHTML(p.term) : ''}</td><td>${esc(p.translation ?? '')}</td></tr>`,
       )
       .join('')}</table>`;
   }

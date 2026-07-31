@@ -31,6 +31,7 @@ function newCard(overrides: Partial<Card> = {}): Card {
     needs_review: null,
     review_reason: null,
     show_source_in_practice: true,
+    show_source_in_study: true,
     tags: [],
     note_type: 'basic',
     fields: {},

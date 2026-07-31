@@ -14,6 +14,7 @@ import { renderStacksList } from './pages/stacksList';
 import { renderStudyPicker } from './pages/studyPicker';
 import { renderStudyMode } from './pages/studyMode';
 import { initAccentKeyboard } from './lib/accentKeyboard';
+import { initTheme } from './lib/theme';
 import { $, errMsg, esc, toast } from './lib/dom';
 import type { CardWithNote, Deck, DeckWithCounts } from './types';
 
@@ -21,6 +22,7 @@ const app = $(document, '#app');
 const topRight = $(document, '#topRight');
 
 initAccentKeyboard();
+initTheme($<HTMLInputElement>(document, '#themeToggle'));
 
 type View =
   | { name: 'library' }
@@ -41,6 +43,7 @@ let view: View = { name: 'library' };
 let wasAuthenticated = false;
 let disposeSession: (() => void) | null = null;
 let disposeImportDetail: (() => void) | null = null;
+/** Purely a UI-visibility flag now (admin-only monitoring panel) — doesn't gate import capability, see 20260812000000_retire_admin_role.sql. */
 let isAdmin = false;
 
 function renderHeader(session: Session | null, due?: number, streak?: number): void {
@@ -265,10 +268,10 @@ function route(session: Session | null): void {
   getMyRole()
     .then((role) => {
       isAdmin = role === 'admin';
-      if (view.name === 'library') renderView(session);
+      if (view.name === 'import-detail') renderView(session);
     })
     .catch(() => {
-      /* not fatal — the import entry point just stays hidden */
+      /* not fatal — the admin-only monitoring panel just stays hidden */
     });
   renderView(session);
 }

@@ -177,10 +177,10 @@ export async function renderStudyPicker(container: HTMLElement, deps: StudyPicke
     const count = countFor(tile);
     const zeroMatch = tagFilter.length > 0 && count === 0;
     return `
-      <div class="stack-card ${checked ? 'stack-card-selected' : ''} ${zeroMatch ? 'stack-card-muted' : ''}" data-tile-id="${esc(tile.id)}">
+      <div class="stack-card stack-card-selectable ${checked ? 'stack-card-selected' : ''} ${zeroMatch ? 'stack-card-muted' : ''}" data-tile-id="${esc(tile.id)}" role="checkbox" aria-checked="${checked}" tabindex="0">
         <div class="stack-card-top">
-          <span class="toggle-switch toggle-switch-sm" title="Select for Study"><input type="checkbox" data-select-tile="${esc(tile.id)}" ${checked ? 'checked' : ''}><span class="toggle-slider"></span></span>
           <span class="stack-card-icon">${tile.isImport ? '📚' : '🗂️'}</span>
+          <span class="stack-card-check" aria-hidden="true">✓</span>
         </div>
         <div class="stack-card-title">${esc(tile.name)}</div>
         <div class="stack-card-meta">
@@ -190,14 +190,22 @@ export async function renderStudyPicker(container: HTMLElement, deps: StudyPicke
   }
 
   function wireBody(): void {
-    container.querySelectorAll<HTMLInputElement>('[data-select-tile]').forEach((cb) => {
-      cb.addEventListener('change', () => {
-        const id = cb.dataset.selectTile!;
-        if (cb.checked) selectedTileIds.add(id);
+    container.querySelectorAll<HTMLElement>('.stack-card[data-tile-id]').forEach((card) => {
+      const id = card.dataset.tileId!;
+      const toggle = (): void => {
+        const nowSelected = !selectedTileIds.has(id);
+        if (nowSelected) selectedTileIds.add(id);
         else selectedTileIds.delete(id);
-        const card = container.querySelector(`.stack-card[data-tile-id="${id}"]`);
-        card?.classList.toggle('stack-card-selected', cb.checked);
+        card.classList.toggle('stack-card-selected', nowSelected);
+        card.setAttribute('aria-checked', String(nowSelected));
         renderSelectionBar();
+      };
+      card.addEventListener('click', toggle);
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
       });
     });
     container.querySelectorAll<HTMLButtonElement>('[data-select-all]').forEach((btn) => {

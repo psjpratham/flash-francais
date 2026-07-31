@@ -14,11 +14,11 @@ export interface SessionDeps {
   onSeeAllStats: () => void;
 }
 
-const GRADE_META: { n: string; c: string }[] = [
-  { n: 'Again', c: 'var(--red)' },
-  { n: 'Hard', c: 'var(--amber)' },
-  { n: 'Good', c: 'var(--green)' },
-  { n: 'Easy', c: 'var(--indigo)' },
+const GRADE_META: { n: string; c: string; arrow: string; meaning: string }[] = [
+  { n: 'Again', c: 'var(--red)', arrow: '←', meaning: "didn't know it" },
+  { n: 'Hard', c: 'var(--amber)', arrow: '↑', meaning: 'knew it, but tough' },
+  { n: 'Good', c: 'var(--green)', arrow: '→', meaning: 'normal effort' },
+  { n: 'Easy', c: 'var(--indigo)', arrow: '↓', meaning: 'knew it instantly' },
 ];
 
 /** [dx, dy] unit direction for each grade index (0=Again..3=Easy): left, up, right, down. */
@@ -30,6 +30,21 @@ const GRADE_DIR: [number, number][] = [
 ];
 
 const SWIPE_THRESHOLD = 72;
+
+/**
+ * A brief, non-interactive (pointer-events:none) overlay teaching the
+ * swipe-to-grade gesture — see `showSwipeHint` in render(). Rather than
+ * static arrows, this is an actual demo motion: a translucent ghost card
+ * physically slides + rotates to the right (the "Good" direction, the most
+ * common grade) with a fingertip dot tracing the same path, mirroring the
+ * real fly-off animation grade() plays on an actual swipe.
+ */
+const SWIPE_HINT_HTML = `
+  <div class="swipe-hint" id="swipeHint">
+    <div class="sh-ghost"></div>
+    <div class="sh-dot"></div>
+    <span class="sh-hint-text">Swipe to grade</span>
+  </div>`;
 
 /** gi (0-3, matching GRADE_META) for a drag delta, or null if under threshold. */
 function swipeGrade(dx: number, dy: number): number | null {
@@ -76,6 +91,8 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
   let visibleChips: ProfileChip[] = [];
   const sessRatings: Record<Rating, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
   let deckStats: DeckStatsWithStreak | null = null;
+  /** Shown once per session — the first time the first card flips and grading becomes possible — never again after that, even if this card re-renders (e.g. once its page image finishes loading). */
+  let swipeHintShown = false;
 
   // drag state
   let sx = 0;
@@ -164,21 +181,17 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       </aside>`;
   }
 
-  /** The same split page-image + rendered-card layout the admin review UI uses, reused here so an imported card studies exactly like it reads — but only when this card's own "show source in practice" toggle is on; otherwise it's just the card content, full width. */
+  /** An imported card's own rendered-block content — goes inside the flip/swipe card exactly like any other card's face. The source page image (when this card's "show source in practice" toggle is on) is deliberately NOT part of this — see sourceImagePaneHTML — so the swipe-to-grade drag only ever moves the small text card, never a full page image alongside it. */
   function importedCardBodyHTML(sourceBlock: CardWithNote): string {
-    const content = `<div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>`;
-    if (!sourceBlock.show_source_in_practice) {
-      return `<div class="session-imported-split session-imported-solo">${content}</div>`;
-    }
+    return `<div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>`;
+  }
+
+  /** The source page image for a card with "show source in practice" on, rendered as its own panel beside the flip/swipe card (see session-study-row) rather than inside it — dragging/grading the card never touches this pane. Null when the toggle is off or there's no image (yet). */
+  function sourceImagePaneHTML(sourceBlock: CardWithNote): string | null {
+    if (!sourceBlock.show_source_in_practice) return null;
     const imagePath = sourceBlock.import_pages?.rendered_page_path ?? null;
     const imageUrl = imagePath ? pageImageUrls.get(imagePath) : null;
-    return `
-      <div class="session-imported-split">
-        ${content}
-        <div class="session-imported-right">
-          ${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original source">` : '<div class="p-text">Source image not available.</div>'}
-        </div>
-      </div>`;
+    return `<div class="session-source-pane">${imageUrl ? `<img src="${esc(imageUrl)}" alt="Original source">` : '<div class="p-text">Source image not available.</div>'}</div>`;
   }
 
   function render(): void {
@@ -216,6 +229,16 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     if (sourceBlock) flipped = true;
     const importedFaceHTML = sourceBlock ? importedCardBodyHTML(sourceBlock) : '';
     const generatedOtherFaceHTML = isGeneratedOther ? importedCardBodyHTML(card) : '';
+    // The source page image (when its own toggle is on) always renders as a panel
+    // beside the card, never inside the flip/swipe element itself — see
+    // sourceImagePaneHTML's doc comment for why.
+    const sourceImageHTML = sourceBlock ? sourceImagePaneHTML(sourceBlock) : isGeneratedOther || isFlashcard ? sourceImagePaneHTML(card) : null;
+    // Once per session, the moment grading first becomes possible (first
+    // card, flipped) — a brief, non-blocking overlay teaching the swipe
+    // gesture. Never shown again after this, even if this same card
+    // re-renders for an unrelated reason (e.g. its page image finishing).
+    const showSwipeHint = flipped && pos === 0 && !swipeHintShown;
+    if (showSwipeHint) swipeHintShown = true;
 
     container.innerHTML = `
       <div class="session-layout ${sourceBlock || isGeneratedOther ? 'session-layout-wide' : ''}">
@@ -227,12 +250,14 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
           </div>
           <div class="sessbar"><span style="width:${Math.round((pos / total) * 100)}%"></span></div>
 
+          <div class="session-study-row">
           <div class="zone" id="zone">
+            ${showSwipeHint ? SWIPE_HINT_HTML : ''}
             <div class="verdict" id="verdict"><span id="verdictTxt"></span></div>
-            <div class="card ${flipped ? 'flipped' : ''} ${sourceBlock || isGeneratedOther ? 'session-card-imported' : ''} ${isFlashcard ? 'pf-card-tall' : ''}" id="card">
+            <div class="card ${flipped && !sourceBlock ? 'flipped' : ''} ${sourceBlock || isGeneratedOther ? 'session-card-imported' : ''} ${isFlashcard ? 'pf-card-tall' : ''}" id="card">
               ${
                 sourceBlock
-                  ? `<div class="face front">${importedFaceHTML}</div><div class="face back">${importedFaceHTML}</div>`
+                  ? `<div class="face front">${importedFaceHTML}</div>`
                   : isGeneratedOther
                     ? `<div class="face front">${generatedOtherFaceHTML}</div>`
                     : isFlashcard
@@ -273,6 +298,8 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
               }
             </div>
           </div>
+          ${sourceImageHTML ?? ''}
+          </div>
 
           <div class="chips" id="chips"></div>
           <div class="panel" id="panel">
@@ -283,21 +310,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
           </div>
 
           <div class="controls" id="controls">
-            ${
-              flipped
-                ? `
-              <div class="grade-row">
-                <button class="grade g-again" id="gradeAgain"><span class="gname">Again</span><span class="gwhen"></span></button>
-                <button class="grade g-good" id="gradeGood"><span class="gname">Good</span><span class="gwhen"></span></button>
-              </div>
-              <div class="grade-row">
-                <button class="grade g-hard" id="gradeHard"><span class="gname">Hard</span><span class="gwhen"></span></button>
-                <button class="grade g-easy" id="gradeEasy"><span class="gname">Easy</span><span class="gwhen"></span></button>
-              </div>
-              <div class="legend"><span>← Again</span><span>↑ Hard</span><span>→ Good</span><span>↓ Easy</span></div>
-            `
-                : `<button class="flip-cta" id="flipBtn">Show answer <kbd>space</kbd></button>`
-            }
+            ${flipped ? GRADE_ROW_HTML : `<button class="flip-cta" id="flipBtn">Show answer <kbd>space</kbd></button>`}
           </div>
         </div>
       </div>`;
@@ -361,6 +374,21 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     $(container, '#doneStatsBtn').addEventListener('click', deps.onSeeAllStats);
   }
 
+  /** One button per grade: swipe-direction arrow + name + plain-language meaning baked right into the button (always visible, no separate legend row to duplicate/repeat it), with the live "back in ___" time as a small corner badge, filled in per-card by wireGradeButtons. */
+  function gradeButtonHTML(id: string, cls: string, m: (typeof GRADE_META)[number]): string {
+    return `<button class="grade ${cls}" id="${id}"><span class="gname"><span class="garrow">${m.arrow}</span> ${m.n}</span><span class="gmeaning">${esc(m.meaning)}</span><span class="gwhen"></span></button>`;
+  }
+
+  const GRADE_ROW_HTML = `
+    <div class="grade-row">
+      ${gradeButtonHTML('gradeAgain', 'g-again', GRADE_META[0])}
+      ${gradeButtonHTML('gradeGood', 'g-good', GRADE_META[2])}
+    </div>
+    <div class="grade-row">
+      ${gradeButtonHTML('gradeHard', 'g-hard', GRADE_META[1])}
+      ${gradeButtonHTML('gradeEasy', 'g-easy', GRADE_META[3])}
+    </div>`;
+
   function wireGradeButtons(card: CardWithNote): void {
     const prev = previewAll(card, deckFor(card).desired_retention);
     $<HTMLElement>(container, '#gradeAgain .gwhen').textContent = prev[1];
@@ -372,17 +400,6 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     $(container, '#gradeGood').addEventListener('click', () => void grade(3));
     $(container, '#gradeEasy').addEventListener('click', () => void grade(4));
   }
-
-  const GRADE_ROW_HTML = `
-    <div class="grade-row">
-      <button class="grade g-again" id="gradeAgain"><span class="gname">Again</span><span class="gwhen"></span></button>
-      <button class="grade g-good" id="gradeGood"><span class="gname">Good</span><span class="gwhen"></span></button>
-    </div>
-    <div class="grade-row">
-      <button class="grade g-hard" id="gradeHard"><span class="gname">Hard</span><span class="gwhen"></span></button>
-      <button class="grade g-easy" id="gradeEasy"><span class="gname">Easy</span><span class="gwhen"></span></button>
-    </div>
-    <div class="legend"><span>← Again</span><span>↑ Hard</span><span>→ Good</span><span>↓ Easy</span></div>`;
 
   /**
    * A non-flashcard generation-mode card's "flip" doesn't swap faces (front

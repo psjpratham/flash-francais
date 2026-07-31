@@ -41,8 +41,8 @@ export interface ValidatedBlock {
   tags: string[];
   needs_review: boolean;
   review_reason: string | null;
-  /** 'available' when this block's answer field(s) in `content` were populated from an attached answer key, 'unavailable' when a key was attached but didn't cover this item, null/unset when no key was attached at all (today's default — see readModeRenderers.ts's Verify area). Invalid/unrecognized values fall back to null. */
-  answer_key_status: 'available' | 'unavailable' | 'unknown' | null;
+  /** 'available' when this block's answer field(s) in `content` were populated from an attached answer key, 'inferred' when the key didn't cover it but the model confidently answered it itself (an objective/mechanical item only), 'unavailable' when a key was attached but didn't cover this item and it wasn't confidently inferrable, null/unset when no key was attached at all (today's default — see readModeRenderers.ts's Verify area). Invalid/unrecognized values fall back to null. */
+  answer_key_status: 'available' | 'unavailable' | 'unknown' | 'inferred' | null;
 }
 
 export interface ValidatedPage {
@@ -160,7 +160,7 @@ function toRawText(raw: Record<string, unknown>, reason: string): ValidatedBlock
   };
 }
 
-const ANSWER_KEY_STATUSES = new Set(['available', 'unavailable', 'unknown']);
+const ANSWER_KEY_STATUSES = new Set(['available', 'unavailable', 'unknown', 'inferred']);
 
 export function validateBlock(raw: unknown, path: string): ValidationResult<ValidatedBlock> {
   if (typeof raw !== 'object' || raw === null) return { ok: false, error: `${path}: block is not an object` };
@@ -228,7 +228,7 @@ export function validateBlock(raw: unknown, path: string): ValidationResult<Vali
       tags: normalizeTags(b.tags),
       needs_review: modelNeedsReview,
       review_reason: modelReviewReason,
-      answer_key_status: typeof b.answer_key_status === 'string' && ANSWER_KEY_STATUSES.has(b.answer_key_status) ? (b.answer_key_status as 'available' | 'unavailable' | 'unknown') : null,
+      answer_key_status: typeof b.answer_key_status === 'string' && ANSWER_KEY_STATUSES.has(b.answer_key_status) ? (b.answer_key_status as 'available' | 'unavailable' | 'unknown' | 'inferred') : null,
     },
   };
 }

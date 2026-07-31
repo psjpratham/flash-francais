@@ -6,7 +6,10 @@
 import type { RichTextContent, RichTextNode, RichTextSpan } from '../types';
 import { esc } from './dom';
 
-const PRON_ICON_HTML = ` <button type="button" class="pron-icon" data-pron-play title="Play pronunciation">🔊</button>`;
+/** Same markup/classes readModeRenderers.ts's pronIconHTML produces (duplicated, not imported — that file already imports from this one, so importing back would be circular); wirePronunciationIcons wires either one identically since both just look for [data-pron-play]. Carries the actual segment text via data-pron-text, unlike the old version of this icon which rendered with no payload at all and silently did nothing when clicked. */
+function pronIconHTML(text: string): string {
+  return ` <button type="button" class="pron-icon" data-pron-play data-pron-text="${esc(text)}" title="Play pronunciation"><span class="pron-icon-emoji">🔊</span><span class="pron-icon-spinner"></span></button>`;
+}
 
 function renderSpan(span: RichTextSpan): string {
   let html = esc(span.text);
@@ -41,7 +44,7 @@ export function renderRichText(content: RichTextContent | null | undefined): str
   return out.join('');
 }
 
-/** Same as renderRichText, but appends a non-functional pronunciation icon after each non-heading node — phrase/sentence granularity, never per word. */
+/** Same as renderRichText, but appends a real pronunciation icon (speaking that node's own text) after each non-heading node — phrase/sentence granularity, never per word. */
 export function renderRichTextPronounced(content: RichTextContent | null | undefined, enabled: boolean): string {
   if (!enabled) return renderRichText(content);
   const nodes = content?.nodes ?? [];
@@ -55,8 +58,10 @@ export function renderRichTextPronounced(content: RichTextContent | null | undef
     }
   };
   for (const node of nodes) {
-    const inner = (node.spans ?? []).map(renderSpan).join('');
-    const icon = node.type === 'heading' ? '' : PRON_ICON_HTML;
+    const spans = node.spans ?? [];
+    const inner = spans.map(renderSpan).join('');
+    const plainText = spans.map((s) => s.text).join('');
+    const icon = node.type === 'heading' || !plainText.trim() ? '' : pronIconHTML(plainText);
     if (node.type === 'list_item') {
       listBuf.push(`<li>${inner}${icon}</li>`);
       continue;
@@ -83,10 +88,10 @@ export function splitSentences(text: string): string[] {
   return matches ? matches.map((s) => s.trim()).filter(Boolean) : [trimmed];
 }
 
-/** Renders plain (legacy-shape) text as sentence-level spans, each optionally followed by a non-functional pronunciation icon. */
+/** Renders plain (legacy-shape) text as sentence-level spans, each optionally followed by a real pronunciation icon (speaking that sentence). */
 export function renderTextWithPronunciation(text: string, enabled: boolean): string {
   const sentences = splitSentences(text);
   if (!sentences.length) return '';
   if (!enabled) return `<p>${sentences.map((s) => esc(s)).join(' ')}</p>`;
-  return `<p>${sentences.map((s) => `<span class="read-sentence">${esc(s)}${PRON_ICON_HTML}</span>`).join(' ')}</p>`;
+  return `<p>${sentences.map((s) => `<span class="read-sentence">${esc(s)}${pronIconHTML(s)}</span>`).join(' ')}</p>`;
 }

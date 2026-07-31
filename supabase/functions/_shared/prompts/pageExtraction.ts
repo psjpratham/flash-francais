@@ -109,7 +109,63 @@
 // generate entirely from the model's own knowledge per the admin
 // instructions, with source_text itself (not just flashcard content)
 // authored rather than copied, since there's nothing to copy from.
-export const PROMPT_VERSION = 'card-philosophy-v14';
+//
+// v15 (fix: exercise items mis-extracted as passive text): verified against
+// real production output — a v14 extraction (vs. the same page's v12 run)
+// turned numbered vrai/faux items that should be single_choice cards into
+// inert "text" cards, and the audit pass never caught it (its checklist
+// never named this failure mode explicitly). v15 (a) trims the v14 PROMPT-
+// ONLY section, which meaningfully bloated every single call including
+// ones that never use it — a likely contributor on a cheap/lite model — and
+// (b) adds an explicit audit checklist item + matching repair instruction
+// for "an answerable exercise item extracted as passive text/vocabulary/
+// grammar_rule instead of its real interaction recipe," so this class of
+// mistake gets caught and fixed automatically going forward regardless of
+// root cause.
+//
+// v16 (loosened "never guess" for obviously-inferrable answers): the
+// answer-key rule was previously absolute — no attached key covering an
+// item meant answer_key_status "unavailable", full stop, even when the
+// correct answer was objectively obvious (a grammar conjugation, a
+// vocabulary match). Adds a new "inferred" status: the model may now
+// confidently self-answer an item the key doesn't cover, but ONLY when
+// it's genuinely objective/mechanical — never a comprehension/subjective
+// item, where a real answer key exists precisely because the answer isn't
+// independently derivable. "inferred" is deliberately never conflated with
+// "available" (key-confirmed) anywhere, including in the UI (see
+// readModeRenderers.ts's Verify button).
+//
+// v17 (fix: false "available" claims, under-confident "inferred", collapsed
+// lists) — three findings verified directly against real production data
+// and the actual attached corrigé file:
+// (a) An entire vrai/faux listening-comprehension exercise (5 items) came
+//     back answer_key_status "available" when the real attached corrigé —
+//     downloaded and inspected directly, genuinely one page — has zero
+//     coverage of it at all. The model has never once had audio access in
+//     this pipeline, so this was pure fabrication dressed up as key-
+//     confirmed. Root cause: "available" was pure self-report with no
+//     verification anywhere. Fixed structurally, not just with wording —
+//     audit now ALWAYS runs at least once whenever an answer key is
+//     attached (previously only triggered by unrelated coverage issues, so
+//     could skip entirely), and now gets the real answer key document
+//     attached to its own call for the first time (previously only extraction
+//     and repair had it) so it can actually check claims instead of trusting
+//     them. Added a "quote test" instruction (must be able to point to the
+//     specific line in the key) and an explicit high-risk callout for
+//     audio-dependent items.
+// (b) A grammar fill-in-blank ("___ Espagne") stayed "unavailable" even
+//     though the page's own grammar box spells out the exact rule right
+//     there — confirmed on a fresh v16 extraction, not stale data. The v16
+//     wording buried the confident case under heavy "default to safe"
+//     language with no concrete "the rule is printed right here" example.
+//     Added an explicit high-confidence case for exactly this.
+// (c) A "you will use:" skills list lost its per-item pronunciation,
+//     collapsing into one flat paragraph instead of separate list_item
+//     nodes — the icon system splits by sentence punctuation, and a
+//     ">"-separated topic list has none. Added an explicit list_item
+//     requirement to the "text" recipe, plus audit/repair instructions for
+//     it specifically (previously entirely unaddressed by any prompt).
+export const PROMPT_VERSION = 'card-philosophy-v17';
 
 export const BLOCK_KINDS = ['document', 'interaction', 'image_ref', 'audio_ref'] as const;
 
@@ -146,7 +202,7 @@ Every block may also carry these OPTIONAL top-level fields:
   "translation": string|null     (a faithful, natural English translation of this card's own content — see TRANSLATION below; use null only for a card with nothing to translate, e.g. a bare image_ref)
   "category": string|null        (one of: "vocabulary", "grammar", "culture", "reading", "exercise", "audio", "writing" — a closed label used only to pick an icon/accent color the app already owns; never invent a category outside this list, use null if none fit well)
   "tags": string[]|null          (0-4 short kebab-case labels classifying this card's topic/skill, e.g. "food-and-drink", "present-tense" — see TAGS below; use null/[] only when nothing meaningful applies)
-  "answer_key_status": "available"|"unavailable"|"unknown"|null  (interaction cards only — see ANSWER KEY below. "available" only when you actually populated this card's answer field(s) from an attached answer key; "unavailable" when a key was attached but didn't cover this specific item; "unknown"/null when no answer key was attached to this page at all — the default, current behavior)
+  "answer_key_status": "available"|"unavailable"|"unknown"|"inferred"|null  (interaction cards only — see ANSWER KEY below. "available" only when you actually populated this card's answer field(s) from an attached answer key; "inferred" when the key didn't cover this item but you confidently answered it yourself (a grammar/vocabulary/objective-fact item only — never "available", these must never be confused); "unavailable" when a key was attached but didn't cover this item and you weren't confident enough to infer it; "unknown"/null when no answer key was attached to this page at all — the default, current behavior)
 
 CARD RECIPES ARE EXAMPLES OF COMMON PATTERNS, NOT A CLOSED MENU. Use whichever produces the card that teaches this content best. When a pattern below is a poor fit, use "freeform" rather than forcing it — e.g. a "classify these words as masculine or feminine" exercise is a categorization task, so it should become "categorize", not be squeezed into "matching_pairs" just because both involve two columns.
 
@@ -155,6 +211,7 @@ UNDERSTAND INTENT BEFORE PICKING A RECIPE — this applies to every activity, no
 document recipes: "text", "vocabulary", "flashcard", "grammar_rule", "table", "dialogue"
   "text" -> ${RICH_TEXT_SCHEMA} plus optional "table": string[][]|null and optional "style": "heading"|"passage"|"instruction"|"example"|"note"|null
     Covers reading content that isn't better served by "vocabulary" or "grammar_rule": headings, paragraphs, instructions, examples, reference text. Use "bold"/"italic" ONLY when the source visibly uses that emphasis — never fabricate formatting, never emit raw HTML/Markdown.
+    LIST-SHAPED CONTENT MUST USE SEPARATE "list_item" NODES, ONE PER ITEM — never collapse an enumerated list into a single paragraph/string. Any content that's a series of distinct items — separated by bullets, numbers, ">"/"•" markers, or simply presented as a run of short topics/phrases one after another (e.g. a "you will use:" skills list, a list of vocabulary themes) — is several "list_item" nodes in the "nodes" array, each with its own "spans", not one "paragraph" node holding the whole list as one string. This matters beyond formatting: each node gets its own pronunciation icon when applicable, so a collapsed list silently loses per-item audio for every item after the first.
   "vocabulary" -> { "title": string|null, "pairs": [ { "term": string, "translation": string|null, "example": string|null } ] }
     DEFAULT/FAITHFUL MODE ONLY (no admin instructions attached at all) — use this for ANY group of vocabulary terms (a themed word list, a "les sports"/"les loisirs" style grouping). Whenever ADMIN INSTRUCTIONS ARE attached, use "flashcard" instead, unconditionally — see GENERATION MODE below, this is not optional or content-dependent.
   "flashcard" -> { "front": string, "back": string, "detail": { "ipa": string|null, "examples": [ { "fr": string, "en": string } ]|null, "wiktionary": string|null, "rule": string|null, "table": string[][]|null, "register": string|null, "note": string|null, "tip": string|null }|null }
@@ -210,7 +267,7 @@ Occasionally a page has no numbered source lines at all: a scanned page with no 
 
 EXCEPTION — PROMPT-ONLY (no source content at all)
 
-Occasionally there is no source page at all: no numbered source lines AND no page image — only ADMIN INSTRUCTIONS describing what to generate (e.g. "make 15 flashcards for common French greetings"). You will be told explicitly when this is the case. On such a request, generate cards entirely from your own knowledge, grounded by the admin instructions — this is GENERATION MODE with nothing to be faithful to, so unlike every other case, source_text itself is also authored by you, not copied from anywhere (there is nowhere to copy from). Put the actual card content there (e.g. the French word/phrase/sentence being taught) — never leave it null or empty. source_line_ids stays an empty array always (there are genuinely no source lines to reference). Do not force needs_review true purely for being prompt-only — there's no OCR-style transcription risk here to flag for proofing, unlike the IMAGE-ONLY exception; only flag needs_review for an actual quality concern, same as any other card. Every other GENERATION MODE rule still applies exactly as written (mandatory "flashcard" for recall content, populated answer fields, one flashcard per distinct item, etc.) — the only thing this exception changes is that there is no source to be faithful to. This exception applies ONLY when you are explicitly told there is no source content at all — never invent content in place of real extraction when real source lines or a page image were actually provided.
+Occasionally there is no source page at all — no numbered source lines, no page image, only ADMIN INSTRUCTIONS (e.g. "make 15 flashcards for common French greetings"). You are told explicitly when this applies. Generate cards from your own knowledge, grounded by the instructions. The one thing this changes versus normal GENERATION MODE: source_text itself is also authored by you (there's nothing to copy), never left null. source_line_ids stays empty. Don't force needs_review true just for being prompt-only. Every other rule (mandatory "flashcard" for recall content, populated answers, etc.) is unchanged. Applies ONLY when told there is no source at all — never in place of real extraction.
 
 WHAT MAY FLEX AND WHAT MAY NEVER FLEX
 
@@ -224,11 +281,13 @@ Every card also gets a "translation" field: a faithful, natural English translat
 ANSWER KEY (only when attached)
 
 By default, no page has an answer key attached, and every interaction card's answer field (see CARD RECIPES below) stays null with answer_key_status "unknown" — exactly today's behavior, exercises stay ungraded. Occasionally, in faithful-extraction mode, an answer-key document (a corrigé) is attached alongside the page image — you will be told explicitly when this is the case. When it is:
-- For each interaction card, check whether the attached answer key actually covers that specific exercise/item.
-- If it does, populate that recipe's answer field using ONLY what the key shows — never your own reasoning about what the correct answer "should" be, even if you're confident — and set answer_key_status: "available".
-- If the key is attached but doesn't cover this particular item, leave the answer field null and set answer_key_status: "unavailable".
-- Never guess an answer, even a seemingly obvious one, when there's no answer key attached at all, or when the key doesn't cover this item. A missing answer is always better than a wrong one.
-- "speaking"/"listening"/a "long" text_input have no answer field at all — never invented, regardless of whether a key is attached.
+- THE QUOTE TEST for "available": before you ever write answer_key_status "available", you must be able to point to the specific line/item in the attached key document that states this exact answer. If you can't name which part of the key you're reading it from, it is NOT "available" — don't write that label just because a key is attached and the exercise "seems like the kind of thing" it would cover. Check each item in an exercise INDIVIDUALLY — a key covering item a and b of a set does not mean it covers c and d too; never mark a whole exercise block "available" as a group without verifying every single item separately.
+- Populate that recipe's answer field using ONLY what the key shows — never your own reasoning about what the correct answer "should" be, even if you're confident — and set answer_key_status: "available" (having passed the quote test above).
+- If the key doesn't cover this particular item, you may still answer it YOURSELF, but only when you are genuinely confident it has one single objectively correct answer you can determine independently — a grammar conjugation ("il ___ (finir)" → "finit"), a vocabulary/definition match, an arithmetic or plainly-stated fact. When you do this, set answer_key_status: "inferred" (never "available" — that label is reserved for the real answer key, and the two must never be confused). Populate the answer field with your best answer exactly as you would if guessing were allowed for a "flashcard"'s content — grounded, not fabricated.
+- HIGH CONFIDENCE, NOT A BORDERLINE CASE: when the source page itself visibly states the exact rule or pattern that determines the answer — a grammar box on the same page, a worked example using the identical pattern — treat that as your strongest, safest basis for "inferred", not something to hedge on. E.g. if the page's grammar box shows "pays avec une voyelle → l'Espagne" and the exercise asks "___ Espagne", that's a confident "inferred" of "l'", not "unavailable" — the rule is right there, this is exactly the case "inferred" exists for.
+- LISTENING/AUDIO-DEPENDENT ITEMS ARE HIGH-RISK FOR FALSE "available": you are never given audio, ever, on any page — only a page image and text. A "vrai ou faux" or comprehension item tied to an "Écoutez..." instruction can ONLY be "available" if the exact answer is written out in the attached key's text (a corrigé often does spell out listening-exercise answers in writing, which makes "available" legitimate — but you still must pass the quote test above for that specific item). It can essentially NEVER be "inferred" — you have no way to independently determine what a fictional recorded conversation says. If you can't quote the key's text for a specific listening-comprehension item, it is "unavailable", full stop — do not let a plausible-sounding guess (even one that matches a common textbook-dialogue trope) become an "available" or "inferred" answer.
+- Never do this for anything genuinely ambiguous, subjective, or dependent on interpreting the specific reading passage/audio content (a comprehension question about what a character said or felt, a personal-opinion question, anything where a real textbook answer key exists precisely because the "correct" answer isn't independently derivable) — leave those null with answer_key_status: "unavailable". When you're not sure whether an item is safely inferrable or not, treat it as not — "unavailable" is always the safe default; "inferred" is only for cases with one clear, defensible right answer.
+- "speaking"/"listening"/a "long" text_input have no answer field at all — never invented, regardless of whether a key is attached or how confident you are.
 - This never affects wording fidelity in any way — source_text/prompt/option text still come only from the numbered source lines, exactly as before.
 
 GENERATION MODE (whenever ADMIN INSTRUCTIONS are attached — this is the ONLY signal, never guess it any other way)
@@ -297,7 +356,7 @@ Return ONLY a single JSON object, no markdown, matching exactly:
       "translation": string | null,
       "category": string | null,
       "tags": ["string"] | null,
-      "answer_key_status": "available" | "unavailable" | "unknown" | null,
+      "answer_key_status": "available" | "unavailable" | "unknown" | "inferred" | null,
       "source_line_ids": ["L001"],
       "source_text": "Exact source wording",
       "content": {},
@@ -316,7 +375,7 @@ Before returning, silently verify:
 - every card's translation is genuinely separate generated English, never contaminating source_text, and no card with real content was left with a null translation;
 - tags used are drawn from the EXISTING TAGS list wherever one genuinely fits, and any new tag proposed is broad/reusable, not page-specific;
 - all meaningful (non-furniture) source lines are represented somewhere, and no bare page-number/furniture card was created;
-- no invented content anywhere, and no guessed answers — every populated answer field, and every answer_key_status "available", came from an item an attached answer key actually covers; when no answer key was attached at all, every answer field is null and every answer_key_status is "unknown";
+- no invented content anywhere; every populated answer field with answer_key_status "available" came from an item an attached answer key actually covers; every "inferred" one is an objective/mechanical item you were genuinely confident in (never a comprehension/subjective one); when no answer key was attached at all, every answer field is null and every answer_key_status is "unknown";
 - when admin instructions are attached, every recall-style item became a "flashcard" (never "vocabulary"/"grammar_rule"/a terms "table") and every interaction answer field is populated with a best-effort answer; when no admin instructions are attached, no "flashcard" card exists and interaction answer fields follow ANSWER KEY instead; either way, every flashcard's front/back/detail is grounded in real page content, never fabricated from nothing, and source_text/source_line_ids on it still trace verbatim to the source line;
 - no numbered/lettered item got merged into another card's prompt;
 - a categorization-shaped exercise used "categorize", not a forced matching_pairs; a vocabulary group used "vocabulary"; a grammar point used "grammar_rule";
@@ -372,7 +431,7 @@ export function buildUserPrompt(input: {
     JSON.stringify(input.imageRegions),
     '',
     ...(input.hasAnswerKey
-      ? ['ANSWER KEY', 'An answer-key document is attached alongside the page image — use it to populate answer fields on interaction cards it actually covers, per ANSWER KEY above. Leave a card\'s answer field null (answer_key_status "unavailable") if the key doesn\'t cover that specific item. Never guess.', '']
+      ? ['ANSWER KEY', 'An answer-key document is attached alongside the page image — use it to populate answer fields on interaction cards it actually covers, per ANSWER KEY above. When it doesn\'t cover a specific item, you may answer that item yourself ONLY if you\'re genuinely confident (an objective grammar/vocabulary/fact item) — mark that "inferred", never "available". Otherwise leave the answer field null with answer_key_status "unavailable".', '']
       : []),
     'EXISTING TAGS (prefer these; propose a new one only when none fit — see TAGS)',
     input.existingTags?.length ? input.existingTags.join(', ') : '(none yet — this is the first page processed; propose whatever broad tags genuinely fit)',
@@ -396,7 +455,7 @@ export function buildUserPrompt(input: {
     '- Images should become image_ref cards using the supplied region metadata; a diagram/hierarchy that is really a picture (e.g. a family tree) belongs here too, not in "table".',
     '- Extract visible audio labels as unresolved audio_ref cards.',
     input.hasAnswerKey
-      ? '- An answer key is attached — populate interaction cards\' answer fields only from what it actually shows, never guessed; set answer_key_status accurately per card.'
+      ? '- An answer key is attached — populate interaction cards\' answer fields from what it actually shows ("available"); for an item it doesn\'t cover, you may confidently self-answer an objective grammar/vocabulary/fact item ("inferred") but never a comprehension/subjective one ("unavailable" instead); set answer_key_status accurately per card.'
       : '- No answer key is attached — leave every answer field null and every answer_key_status "unknown", same as always.',
     input.adminInstructions
       ? `- Admin instructions are attached below — this is GENERATION MODE, not faithful extraction: every recall-style item (vocabulary term, grammar point) MUST be a "flashcard" card, never "vocabulary"/"grammar_rule"/a terms table, regardless of what the instructions specifically say. Every interaction recipe's answer field must be populated with your own best answer, even unguided. Front/back/detail/answers are authored${promptOnly ? ', and so is source_text itself (see PROMPT-ONLY above)' : ', grounded in real page content — source_text itself is still always verbatim'}.`
@@ -412,7 +471,7 @@ Remember the app's central principle: the learner sees the original page image a
 
 You are given the same page image (attached as a one-page PDF) the extraction pass had, the original numbered source lines, and the extracted cards. Compare all three and identify fidelity problems.
 
-Do not rewrite the page. Do not add educational content. Do not suggest enrichment. Do not answer exercises yourself. Do not mark harmless whitespace/line-break differences as errors. Do not flag a card for skipping true page furniture (bare page numbers, decorative marks) — that's intended. A populated answer field (correctOptions/answers/correctPairs/correctOrder/correctGroups/turn "answer") and answer_key_status "available" are NOT automatically invented content — this extraction pass is allowed to populate them when an answer key was attached, or with its own best guess when admin instructions are attached (generation mode); only flag one as invented_content if it's obviously wrong or unrelated to the exercise, not merely for existing. Likewise, a "flashcard" card's front/back/detail fields are EXPECTED to be authored (a translation, an example sentence, an IPA transcription) rather than copied verbatim — never flag these as altered wording or invented content merely for being authored; only flag one if it's obviously wrong or ungrounded in this page's real content. Your wording-fidelity check (source_text) is completely unaffected — that field is never authored, on any recipe.
+Do not rewrite the page. Do not add educational content. Do not suggest enrichment. Do not answer exercises yourself. Do not mark harmless whitespace/line-break differences as errors. Do not flag a card for skipping true page furniture (bare page numbers, decorative marks) — that's intended. A populated answer field (correctOptions/answers/correctPairs/correctOrder/correctGroups/turn "answer") and answer_key_status "available" are NOT automatically invented content — this extraction pass is allowed to populate them when an answer key was attached, or with its own best guess when admin instructions are attached (generation mode); only flag one as invented_content if it's obviously wrong or unrelated to the exercise, not merely for existing. In DEFAULT/FAITHFUL mode specifically, verify EVERY card's answer_key_status individually against the actual attached answer-key document (when one is attached to this call — you're told explicitly): for each "available" card, find the specific line/item in the key that states that exact answer; if you cannot, flag it as invented_content — this label means "confirmed by the real key," and a card claiming that without the key actually showing it is a fidelity violation, not a stylistic choice. Give particular scrutiny to a whole exercise/set where every item is marked "available" — checking each item that specifically, individually appears in the key is exactly the check the extraction pass is required to do and easy to skip under time pressure; do the same check yourself here. For "inferred" answers, confirm each is a genuinely objective/mechanical item (grammar conjugation, vocabulary, a plainly-stated fact, especially one whose rule is visibly stated elsewhere on the page) — flag as invented_content any "inferred" answer on a comprehension/subjective/passage-dependent item, and flag ANY answer_key_status on a listening/audio-dependent item ("available" or "inferred") that you cannot trace to specific text in the attached key — an audio-dependent item is never safely "inferred" at all, since nothing on the page or in your own knowledge can substitute for actually hearing the recording. Likewise, a "flashcard" card's front/back/detail fields are EXPECTED to be authored (a translation, an example sentence, an IPA transcription) rather than copied verbatim — never flag these as altered wording or invented content merely for being authored; only flag one if it's obviously wrong or ungrounded in this page's real content. Your wording-fidelity check (source_text) is completely unaffected — that field is never authored, on any recipe.
 
 You are told below whether ADMIN INSTRUCTIONS were attached for this extraction (generation mode) or not (default/faithful mode). This changes what "correct recipe" means: in generation mode, every recall-style item (a vocabulary term, a grammar point) MUST be a "flashcard" card — flag "vocabulary"/"grammar_rule"/a terms table used for recall content in generation mode as incorrect_component_mappings, exactly like any other wrong-recipe mistake. In default/faithful mode, the reverse is true — "flashcard" must never appear at all; flag one if it does.
 
@@ -432,7 +491,9 @@ Check for:
 - single_choice used where the source allows multiple answers, or multi_select used where it allows only one;
 - a freeform tree using a primitive type outside the allowed list, or one that doesn't visually mirror the actual page layout it's representing;
 - a visible section number, title, or instruction that wasn't captured in the corresponding card's fields;
-- a card whose prompt still concatenates multiple numbered/lettered items (including an incomplete vrai/faux battery) that should have been split, one card per item.
+- a card whose prompt still concatenates multiple numbered/lettered items (including an incomplete vrai/faux battery) that should have been split, one card per item;
+- a genuine exercise/question item — anything the learner is meant to actually answer, especially a numbered or lettered vrai/faux statement, a fill-in-the-blank, or any other clearly-interactive item — extracted as a passive "text"/"vocabulary"/"grammar_rule" document card instead of the correct interaction recipe (single_choice for a lone vrai/faux statement, categorize for a grouped batch, text_input for a blank, etc.); this is a real mistake, not a stylistic choice — flag it as incorrect_component_mappings and repair must convert it to the right interaction recipe, never leave content that should be answerable sitting as inert text;
+- a "text" card whose content is a series of distinct items (a skills/topics list, anything bullet/number/">"-separated in the source) collapsed into one flat paragraph string instead of separate "list_item" nodes — flag as formatting_fidelity_issues; this isn't cosmetic, each item is meant to get its own pronunciation icon and a collapsed list silently loses that for every item after the first.
 
 Return valid JSON only:
 {
@@ -461,9 +522,14 @@ export function buildAuditUserPrompt(input: {
   pageExtractionJson: unknown;
   /** True when admin instructions were attached for this extraction — see GENERATION MODE in the system prompt. Drives whether "flashcard" was mandatory (generation mode) or forbidden (default/faithful mode) for recall content. */
   hasAdminInstructions?: boolean;
+  /** True when an answer-key document (corrigé) is attached alongside the page image on THIS call too (not just extraction) — lets audit actually verify an "available"/"inferred" claim against the real document instead of trusting the extraction pass's self-report. See COMPLETENESS_AUDIT_SYSTEM_PROMPT's answer-key verification check. */
+  hasAnswerKey?: boolean;
 }): string {
   return [
     'The same page image (one-page PDF) is attached again — use it as ground truth for card structure/order.',
+    ...(input.hasAnswerKey
+      ? ['The same answer-key document (corrigé) is ALSO attached again this time — use it to actually verify every answer_key_status "available"/"inferred" claim below, per the answer-key verification check.']
+      : []),
     '',
     'MODE',
     input.hasAdminInstructions
@@ -494,13 +560,15 @@ Repair only the identified problems while returning the complete corrected page 
 Rules:
 - preserve correct existing cards;
 - add missing (non-furniture) source content; remove unsupported invented content; restore exact wording;
+- when the audit flags invented_content on an answer_key_status "available"/"inferred" claim it couldn't trace to the real attached answer key: if the item is genuinely a confident objective/mechanical one (grammar/vocabulary/fact), downgrade it to "inferred"; otherwise null the answer field and set answer_key_status "unavailable" — never leave it wrongly labeled "available";
+- when the audit flags list-shaped content collapsed into one paragraph/string (per the "text" recipe's list_item rule), restructure it into separate "list_item" nodes, one per item, using the exact same source wording — this is a structure fix, not a wording change;
 - restore correct card order and grouping (use the page image to determine what's actually correct, especially for reading_order_issues);
 - split a card flagged by merged_subquestion_issues into one card per item;
-- switch to a better-fitting recipe only when the audit flagged the current one as wrong (composed_activity_misuse, choice_intent_errors, incorrect_component_mappings) — never change a recipe that wasn't flagged;
+- switch to a better-fitting recipe only when the audit flagged the current one as wrong (composed_activity_misuse, choice_intent_errors, incorrect_component_mappings) — never change a recipe that wasn't flagged. This includes converting a passive "text"/"vocabulary"/"grammar_rule" card the audit flagged back into the correct interaction recipe (single_choice/categorize/text_input/etc.) when it's actually an answerable exercise item — populate its prompt/options/etc. from the same source wording, plus an answer field per the usual answer-key/generation-mode rules;
 - add or fix a translation only when flagged by translation_issues — never touch source_text while doing so;
 - restore dropped section_number/title/instruction metadata flagged by the audit;
 - restore dropped or invented rich-text emphasis flagged by the audit;
-- never translate the French content itself (only the dedicated translation field); never guess image content; never guess audio filenames; in DEFAULT/FAITHFUL mode (no admin instructions), you may add or fix an interaction answer field ONLY using what an attached answer key actually shows for that item — never guessed, left null with answer_key_status "unavailable" if the key doesn't cover it; in GENERATION MODE (admin instructions attached), fill in any answer field the audit flagged as empty with your own best answer, same as the extraction pass was required to;
+- never translate the French content itself (only the dedicated translation field); never guess image content; never guess audio filenames; in DEFAULT/FAITHFUL mode (no admin instructions), fix an interaction answer field using what an attached answer key actually shows ("available"), or — only for a genuinely confident objective grammar/vocabulary/fact item the key doesn't cover — your own answer marked "inferred" (never "available"); leave anything else null with answer_key_status "unavailable"; in GENERATION MODE (admin instructions attached), fill in any answer field the audit flagged as empty with your own best answer, same as the extraction pass was required to;
 - when the audit flags incorrect_component_mappings because a "vocabulary"/"grammar_rule"/terms-table was used for recall content in generation mode (or "flashcard" was used at all in default/faithful mode), switch it to the correct recipe — this is exactly the "switch to a better-fitting recipe when flagged" rule above, not a new exception. A flagged "flashcard" card's front/back/detail may otherwise be fixed under the exact same rule the extraction pass followed (see GENERATION MODE in the system prompt) — authored/grounded in real page content, never fabricated from nothing. Never introduce a new "flashcard" card that wasn't flagged and never touch its source_text/source_line_ids, which still trace verbatim to the source line;
 - when the audit flags incorrect_component_mappings because a standalone "text" heading only labels a group of flashcards, REMOVE that card entirely from the output (do not merely reword or re-recipe it) — reassign any source_line_ids it held to one of the flashcards it was labeling (so line coverage is preserved) and fold its wording into their shared category/tags/detail.note, per GENERATION MODE;
 - every meaningful (non-furniture) source line must be represented;

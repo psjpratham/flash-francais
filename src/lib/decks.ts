@@ -1,9 +1,33 @@
 import { supabase } from './supabase';
-import type { Deck, DeckStatsWithStreak, DeckTagCount, DeckWithCounts } from '../types';
+import type { Deck, DeckStatsWithStreak, DeckTagCount, DeckWithCounts, PublicDeckSearchResult } from '../types';
 
-/** All of the current user's decks, ordered oldest-first (RLS scopes this to their own rows). */
+/** The short, human-friendly form of a deck id shown in the UI (deck header, search results) — the id's first 8 hex characters, upper-cased. Search-by-id also matches on this prefix (see search_public_decks). */
+export function shortDeckId(id: string): string {
+  return id.slice(0, 8).toUpperCase();
+}
+
+/**
+ * The decks that belong in "Your decks": ones the current user owns, plus
+ * admin-curated `visibility='shared'` decks. Explicitly scoped rather than
+ * relying on RLS alone — RLS's decks_select also allows any *other* user's
+ * `is_public` deck through (that's what makes search_public_decks work), so
+ * an unfiltered select here would leak every public deck into every user's
+ * library the moment it's marked public. Public decks are only ever meant
+ * to surface via search, never auto-added to anyone's collection.
+ */
 export async function listDecks(): Promise<Deck[]> {
-  const { data, error } = await supabase.from('decks').select('*').order('created_at', { ascending: true });
+  const {
+    data: { user },
+    error: userError,
+  } = await supabase.auth.getUser();
+  if (userError) throw userError;
+  if (!user) throw new Error('Not signed in');
+
+  const { data, error } = await supabase
+    .from('decks')
+    .select('*')
+    .or(`user_id.eq.${user.id},visibility.eq.shared`)
+    .order('created_at', { ascending: true });
   if (error) throw error;
   return data;
 }
@@ -68,6 +92,12 @@ export async function createSharedDraftDeck(name: string): Promise<Deck> {
   return data;
 }
 
+export async function renameDeck(deckId: string, name: string): Promise<Deck> {
+  const { data, error } = await supabase.from('decks').update({ name }).eq('id', deckId).select().single();
+  if (error) throw error;
+  return data;
+}
+
 /**
  * Publishes an admin-owned shared draft deck, making it readable by all
  * authenticated users. RLS enforces that only the deck's admin owner can do
@@ -84,6 +114,77 @@ export async function publishDeck(deckId: string): Promise<Deck> {
     .single();
   if (error) throw error;
   return data;
+}
+
+/**
+ * Toggles whether this deck is publicly searchable/readable by every other
+ * authenticated user (see search_public_decks). RLS (`decks_update`)
+ * restricts this to the deck's owner. Independent of the admin-curated
+ * `visibility='shared'` system.
+ */
+export async function setDeckPublic(deckId: string, isPublic: boolean): Promise<Deck> {
+  const { data, error } = await supabase.from('decks').update({ is_public: isPublic }).eq('id', deckId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+/** Searches every other user's public deck by title, author display name, or id prefix (see shortDeckId) — empty/blank query returns the most recently published public decks. */
+export async function searchPublicDecks(query: string): Promise<PublicDeckSearchResult[]> {
+  const { data, error } = await supabase.rpc('search_public_decks', { p_query: query.trim() || null });
+  if (error) throw error;
+  return data;
+}
+
+interface CloneDeckResponse {
+  ok: boolean;
+  deck?: Deck;
+  cardCount?: number;
+  error?: string;
+}
+
+/**
+ * Adds a public deck to the caller's own library — a complete, independent,
+ * physical copy: every card regardless of origin, every referenced source
+ * page, and every referenced image/PDF/audio file, all duplicated into rows
+ * and storage paths the caller owns, with fresh FSRS state (new cards,
+ * never studied). Never a link to the original — studying it can't affect
+ * the original owner's progress, and the original being edited, un-
+ * published, or deleted later can't affect this copy either.
+ *
+ * Goes through an edge function (see supabase/functions/clone-public-deck),
+ * not a plain RPC, because copying the actual file bytes in Storage isn't
+ * something a SQL function can do — only the Storage API can, which means
+ * running with the service-role key.
+ */
+export async function addPublicDeckToMyDecks(sourceDeckId: string, name?: string): Promise<Deck> {
+  const { data, error } = await supabase.functions.invoke<CloneDeckResponse>('clone-public-deck', {
+    body: { sourceDeckId, name: name ?? null },
+  });
+  if (error) throw new Error(await cloneErrorMessage(error));
+  if (!data?.ok || !data.deck) throw new Error(data?.error ?? 'Could not add this deck.');
+  return data.deck;
+}
+
+/**
+ * supabase.functions.invoke's error on a non-2xx response is always the
+ * generic "Edge Function returned a non-2xx status code" (see
+ * FunctionsHttpError in @supabase/functions-js) — the function's own
+ * `{ ok: false, error: "..." }` JSON body, which has the actual reason, is
+ * left on `error.context` (the raw Response) and never surfaced
+ * automatically. Read it so a failed clone shows the real cause, not just
+ * "non-2xx code".
+ */
+async function cloneErrorMessage(error: { message: string; context?: unknown }): Promise<string> {
+  const context = error.context;
+  if (context instanceof Response) {
+    try {
+      const body = (await context.clone().json()) as Partial<CloneDeckResponse>;
+      if (body?.error) return body.error;
+    } catch {
+      /* body wasn't JSON (e.g. a platform-level 546/504) — fall through to the generic message */
+    }
+  }
+  return error.message;
 }
 
 /**

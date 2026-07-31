@@ -1,5 +1,5 @@
-import { listDecksWithCounts, createDeck, fetchDeckStats } from '../lib/decks';
-import type { DeckStatsWithStreak, DeckWithCounts } from '../types';
+import { listDecksWithCounts, createDeck, fetchDeckStats, searchPublicDecks, shortDeckId, addPublicDeckToMyDecks } from '../lib/decks';
+import type { DeckStatsWithStreak, DeckWithCounts, PublicDeckSearchResult } from '../types';
 import { $, esc, errMsg, openModal, toast } from '../lib/dom';
 import { accuracyPct, statsMoreHTML } from './statsPanel';
 
@@ -14,6 +14,14 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
   let decks: DeckWithCounts[] = [];
   let statsData: DeckStatsWithStreak | null = null;
   let showMoreStats = false;
+
+  let searchQuery = '';
+  let searchResults: PublicDeckSearchResult[] = [];
+  let searching = false;
+  let searchError: string | null = null;
+  let searchDebounce: ReturnType<typeof setTimeout> | undefined;
+  let searchToken = 0;
+  const addingDeckIds = new Set<string>();
 
   function totalDue(): number {
     return decks.reduce((a, d) => a + d._due + d._new, 0);
@@ -32,8 +40,24 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
             : ''
         }
         <div id="libStats">${statsData ? statsHTML(statsData) : '<div class="stats-loading">Crunching numbers…</div>'}</div>
+
+        <div class="panelbox" id="publicSearchBox">
+          <h3>🔎 Discover public decks</h3>
+          <div class="field">
+            <input id="publicSearchInput" placeholder="Search by title, author, or deck ID…" value="${esc(searchQuery)}">
+          </div>
+          <div id="publicSearchResults"></div>
+        </div>
+
         <div class="grid" id="deckGrid"></div>
       </div>`;
+
+    $(container, '#publicSearchInput').addEventListener('input', (e) => {
+      searchQuery = (e.target as HTMLInputElement).value;
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => void runSearch(), 300);
+    });
+    renderSearchResults();
 
     const grid = $(container, '#deckGrid');
     grid.innerHTML =
@@ -125,6 +149,94 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
     });
   }
 
+  async function runSearch(): Promise<void> {
+    const query = searchQuery.trim();
+    if (!query) {
+      searching = false;
+      searchError = null;
+      searchResults = [];
+      renderSearchResults();
+      return;
+    }
+    const token = ++searchToken;
+    searching = true;
+    searchError = null;
+    renderSearchResults();
+    try {
+      const results = await searchPublicDecks(query);
+      if (token !== searchToken) return; // a newer keystroke's search already superseded this one
+      searchResults = results;
+    } catch (e) {
+      if (token !== searchToken) return;
+      searchError = errMsg(e);
+      searchResults = [];
+    } finally {
+      if (token === searchToken) searching = false;
+      renderSearchResults();
+    }
+  }
+
+  function renderSearchResults(): void {
+    const el = document.getElementById('publicSearchResults');
+    if (!el) return; // navigated away
+    if (!searchQuery.trim()) {
+      el.innerHTML = '';
+      return;
+    }
+    if (searching) {
+      el.innerHTML = '<div class="stats-loading">Searching…</div>';
+      return;
+    }
+    if (searchError) {
+      el.innerHTML = `<p class="p-text">Could not search: ${esc(searchError)}</p>`;
+      return;
+    }
+    if (!searchResults.length) {
+      el.innerHTML = '<p class="p-text">No public decks match that search.</p>';
+      return;
+    }
+    el.innerHTML = `<div class="grid">${searchResults
+      .map((r) => {
+        const adding = addingDeckIds.has(r.id);
+        return `
+      <div class="course public-deck-result" data-id="${r.id}">
+        <div class="course-top">
+          <div class="course-badge">🌍</div>
+          <div><div class="course-title">${esc(r.name)}</div><div class="course-meta">by ${esc(r.author_display_name ?? 'Anonymous')}</div></div>
+        </div>
+        <div class="course-foot">
+          <span class="pill">${r.card_count} card${r.card_count === 1 ? '' : 's'}</span>
+          <span class="pill deck-id-pill" title="Deck ID">#${esc(shortDeckId(r.id))}</span>
+          <button class="btn-sec add-public-deck-btn" data-id="${r.id}" ${adding ? 'disabled' : ''} style="margin-left:auto">
+            ${adding ? 'Adding…' : '+ Add to my decks'}
+          </button>
+        </div>
+      </div>`;
+      })
+      .join('')}</div>`;
+
+    el.querySelectorAll<HTMLButtonElement>('.add-public-deck-btn').forEach((btn) => {
+      btn.addEventListener('click', () => void addFromSearch(btn.dataset.id!));
+    });
+  }
+
+  async function addFromSearch(deckId: string): Promise<void> {
+    if (addingDeckIds.has(deckId)) return;
+    addingDeckIds.add(deckId);
+    renderSearchResults();
+    try {
+      const added = await addPublicDeckToMyDecks(deckId);
+      toast(`"${added.name}" added to your decks`);
+      await loadDecks();
+      render();
+    } catch (e) {
+      toast('Could not add deck: ' + errMsg(e));
+    } finally {
+      addingDeckIds.delete(deckId);
+      renderSearchResults();
+    }
+  }
+
   async function loadDecks(): Promise<void> {
     try {
       decks = await listDecksWithCounts();
@@ -160,7 +272,7 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
   function statsHTML(data: DeckStatsWithStreak): string {
     return `
       <div class="panelbox">
-        <h3>📊 Your stats</h3>
+        <h3>📊 Your stats <span class="stats-scope-note">— across all your decks</span></h3>
         <div class="stat-grid">
           <div class="stat-item"><div class="stat-v">${data.reviews.today}</div><div class="stat-k">reviewed today</div></div>
           <div class="stat-item"><div class="stat-v">${accuracyPct(data.ratingsToday)}%</div><div class="stat-k">accuracy today</div></div>

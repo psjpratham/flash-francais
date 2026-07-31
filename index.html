@@ -11,6 +11,22 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap"
       rel="stylesheet"
     />
+    <!-- Resolves the theme before first paint (localStorage, falling back to
+         the OS preference) — doing this in main.ts would flash light mode
+         first on every dark-mode load. lib/theme.ts's initTheme() reads this
+         same attribute back rather than re-deriving it, so there's one
+         source of truth for "what theme did we start in". -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('ff-theme');
+          var theme = saved === 'dark' || saved === 'light' ? saved : window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {
+          /* localStorage/matchMedia unavailable — CSS's own light-mode defaults still apply */
+        }
+      })();
+    </script>
   </head>
   <body>
     <header class="top">
@@ -19,7 +35,17 @@
           <div class="brand-mark">F</div>
           <div class="brand-name">Flash Francais</div>
         </div>
-        <div class="top-right" id="topRight"></div>
+        <div class="top-right-group">
+          <label class="theme-switch" title="Toggle dark mode">
+            <input type="checkbox" id="themeToggle" aria-label="Toggle dark mode" />
+            <span class="theme-switch-track">
+              <span class="theme-switch-icon sun">☀️</span>
+              <span class="theme-switch-icon moon">🌙</span>
+              <span class="theme-switch-knob"></span>
+            </span>
+          </label>
+          <div class="top-right" id="topRight"></div>
+        </div>
       </div>
     </header>
 

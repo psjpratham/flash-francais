@@ -1,6 +1,6 @@
-import { deleteDeckDeep, fetchDeckStats, getDeckWithCounts } from '../lib/decks';
+import { deleteDeckDeep, fetchDeckStats, getDeckWithCounts, renameDeck, setDeckPublic, shortDeckId } from '../lib/decks';
 import type { DeckStatsWithStreak, DeckWithCounts } from '../types';
-import { $, errMsg, esc, toast } from '../lib/dom';
+import { $, errMsg, esc, promptDialog, toast } from '../lib/dom';
 import { accuracyPct, statsMoreHTML } from './statsPanel';
 
 export interface DeckDetailDeps {
@@ -28,6 +28,7 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
   let deleting = false;
   let deleteError: string | null = null;
   let showOverflowMenu = false;
+  let togglingPublic = false;
 
   async function load(): Promise<void> {
     try {
@@ -47,16 +48,20 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
     container.innerHTML = `
       <div class="wrap">
         <button class="back-link" id="backBtn">← Decks</button>
-        <div class="page-h"><h1>${esc(deck.name)}</h1><p>${deck._due} due · ${deck._new} new</p></div>
+        <div class="page-h">
+          <h1>${esc(deck.name)} ${deck.is_public ? '<span class="pill" title="Anyone can find and view this deck">🌍 Public</span>' : ''}</h1>
+          <p>${deck._due} due · ${deck._new} new · <span class="deck-id-badge" title="Deck ID — used to find this deck by search">#${esc(shortDeckId(deck.id))}</span></p>
+        </div>
 
         <div class="hero-row">
           <button class="hero-cta hero-cta-practice" id="startSessionBtn">
             <span class="hero-cta-main">▶ Practice Mode</span>
             <span class="hero-cta-sub">${deck._due + deck._new} cards ready</span>
+            <span class="hero-cta-sub hero-cta-sub-detail">Test yourself and track your progress.</span>
           </button>
           <button class="hero-cta hero-cta-study" id="openStudyPickerBtn">
             <span class="hero-cta-main">📖 Study Mode</span>
-            <span class="hero-cta-sub">Read through any stack, no scheduling</span>
+            <span class="hero-cta-sub hero-cta-sub-detail">Flip through your cards at your own pace to revise or study.</span>
           </button>
         </div>
 
@@ -69,6 +74,8 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
                    ${
                      showOverflowMenu
                        ? `<div class="toolbar-more-menu">
+                            <button class="btn-sec" id="renameDeckBtn">✎ Rename deck</button>
+                            <button class="btn-sec" id="togglePublicBtn" ${togglingPublic ? 'disabled' : ''}>${deck.is_public ? '🔒 Make private' : '🌍 Make public'}</button>
                             <button class="btn-sec" id="importContentBtn">📥 Import content</button>
                             <button class="btn-sec" id="deleteDeckBtn">🗑 Delete deck</button>
                           </div>`
@@ -92,6 +99,15 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
       showOverflowMenu = !showOverflowMenu;
       render();
     });
+    document.getElementById('renameDeckBtn')?.addEventListener('click', () => {
+      showOverflowMenu = false;
+      render();
+      void doRenameDeck();
+    });
+    document.getElementById('togglePublicBtn')?.addEventListener('click', () => {
+      showOverflowMenu = false;
+      void doTogglePublic();
+    });
     document.getElementById('importContentBtn')?.addEventListener('click', () => deps.onImportContent(deck!.id, deck!.name));
     document.getElementById('deleteDeckBtn')?.addEventListener('click', () => {
       showOverflowMenu = false;
@@ -103,6 +119,41 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
 
     renderStatsSection();
     renderDeleteDeckSection();
+  }
+
+  // ---------- rename deck ----------
+
+  async function doRenameDeck(): Promise<void> {
+    if (!deck) return;
+    const name = await promptDialog('Rename deck', deck.name);
+    if (!name || name === deck.name) return;
+    try {
+      const updated = await renameDeck(deck.id, name);
+      deck.name = updated.name;
+      render();
+      toast('Deck renamed.');
+    } catch (e) {
+      toast('Could not rename: ' + errMsg(e));
+    }
+  }
+
+  // ---------- public toggle ----------
+
+  async function doTogglePublic(): Promise<void> {
+    if (!deck || togglingPublic) return;
+    const nextPublic = !deck.is_public;
+    togglingPublic = true;
+    render();
+    try {
+      const updated = await setDeckPublic(deck.id, nextPublic);
+      deck.is_public = updated.is_public;
+      toast(nextPublic ? 'Deck is now public — anyone can find it by title, author, or ID.' : 'Deck is private again.');
+    } catch (e) {
+      toast('Could not update visibility: ' + errMsg(e));
+    } finally {
+      togglingPublic = false;
+      render();
+    }
   }
 
   // ---------- delete deck ----------
@@ -167,7 +218,7 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
   function statsHTML(data: DeckStatsWithStreak): string {
     return `
       <div class="panelbox">
-        <h3>📊 This deck's stats</h3>
+        <h3>📊 This deck's stats <span class="stats-scope-note">— just this deck, not the others</span></h3>
         <div class="stat-grid">
           <div class="stat-item"><div class="stat-v">${data.reviews.today}</div><div class="stat-k">reviewed today</div></div>
           <div class="stat-item"><div class="stat-v">${accuracyPct(data.ratingsToday)}%</div><div class="stat-k">accuracy today</div></div>

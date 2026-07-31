@@ -52,6 +52,11 @@ export async function createImport(deckId: string, title: string, forceImageOnly
   return data;
 }
 
+export async function renameImport(importId: string, title: string): Promise<void> {
+  const { error } = await supabase.from('imports').update({ title }).eq('id', importId);
+  if (error) throw error;
+}
+
 /**
  * A prompt-mode import with no attached source at all — cards are generated
  * purely from the admin's own knowledge, grounded by `prompt`, with nothing

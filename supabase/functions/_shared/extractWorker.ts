@@ -445,7 +445,17 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   let auditResult: Record<string, unknown> | null = null;
   let modelWarnings = attempt.pageWarnings;
 
-  const needsAudit = () => coverageHasIssues(coverage) || modelWarnings.length > 0;
+  // Whenever an answer key is attached, always run at least one audit pass
+  // — verified against real production data that the model can mark
+  // answer_key_status "available" on an entire exercise block the actual
+  // attached key doesn't cover at all (a listening-comprehension vrai/faux
+  // set, confirmed by direct comparison against the real corrigé file), and
+  // with neither a coverage issue nor a model warning raised, audit would
+  // otherwise never even run to catch it. This only forces the first
+  // iteration to happen — the loop's own early-exit (below) still breaks
+  // immediately once audit reports a clean pass, so an already-correct page
+  // costs exactly one extra call, never more.
+  const needsAudit = () => coverageHasIssues(coverage) || modelWarnings.length > 0 || !!answerKey;
   // A page can chain up to 1 (extraction) + 2x(audit+repair) calls; each
   // call already has its own hard timeout (see gemini.ts), but this caps
   // the *job's* total wall-clock too, well below the Edge Function platform
@@ -454,10 +464,13 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   const withinJobBudget = () => Date.now() - jobStarted < JOB_TIME_BUDGET_MS;
 
   const pdfInlineData = pagePdfBase64 ? [{ mimeType: visualMimeType, base64: pagePdfBase64 }] : undefined;
-  // The repair stage (unlike audit/polish) is where answer fields actually
-  // get written/fixed, so it's the one other stage that needs the answer
-  // key attached alongside the page's own slice.
-  const repairInlineData = [...(pdfInlineData ?? []), ...(answerKey ? [{ mimeType: answerKey.mimeType, base64: answerKey.base64 }] : [])];
+  // Audit now needs the real answer key too — not just repair — so it can
+  // actually check an "available"/"inferred" claim against the real
+  // document instead of taking the extraction pass's self-report on faith
+  // (see COMPLETENESS_AUDIT_SYSTEM_PROMPT's answer-key verification check).
+  const answerKeyInlineData = answerKey ? [{ mimeType: answerKey.mimeType, base64: answerKey.base64 }] : [];
+  const auditInlineData = [...(pdfInlineData ?? []), ...answerKeyInlineData];
+  const repairInlineData = [...(pdfInlineData ?? []), ...answerKeyInlineData];
 
   for (let repairAttempt = 1; repairAttempt <= MAX_REPAIR_ATTEMPTS && needsAudit() && withinJobBudget(); repairAttempt++) {
     const auditOutcome = await callGemini({
@@ -467,8 +480,9 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
         imageRegions,
         pageExtractionJson: { blocks, page_warnings: modelWarnings },
         hasAdminInstructions: !!adminInstructions,
+        hasAnswerKey: !!answerKey,
       }),
-      inlineData: pdfInlineData,
+      inlineData: auditInlineData.length ? auditInlineData : undefined,
     });
     if (!auditOutcome.ok) break;
     const parsedAudit = parseJsonContent(auditOutcome.content);

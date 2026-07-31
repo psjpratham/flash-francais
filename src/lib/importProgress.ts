@@ -6,13 +6,19 @@ import type { ImportSourceType } from '../types';
 /** One unified status vocabulary for every import type — never a raw job status or RPC name. */
 export type ImportProgressStatus = 'pending' | 'running' | 'completed' | 'completed_with_errors' | 'failed';
 
-/** User-facing stage labels — never "idle", a job status, or Edge Function terminology. The page is the only content unit: no chapter/lesson/section wording anywhere here. */
+/**
+ * User-facing stage labels — never "idle", a job status, or Edge Function
+ * terminology. Short present-participle words, Claude-loading-indicator
+ * style ("Working…", "Extracting…"), not clinical phrases like "Extracting
+ * pages" or "Final validation". The page is the only content unit: no
+ * chapter/lesson/section wording anywhere here.
+ */
 export const STAGE = {
   PREPARING: 'Preparing',
   UPLOADING: 'Uploading',
-  READING: 'Reading pages',
-  EXTRACTING: 'Extracting pages',
-  VALIDATING: 'Final validation',
+  READING: 'Reading',
+  EXTRACTING: 'Extracting',
+  VALIDATING: 'Designing cards',
   READY: 'Ready',
 } as const;
 

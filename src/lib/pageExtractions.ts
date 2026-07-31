@@ -392,9 +392,12 @@ export async function clearStudyAnswersForCards(cardIds: string[]): Promise<void
   if (error) throw error;
 }
 
-/** Per-card choice: whether Study/Practice shows this card's source image alongside it — independent of include_in_practice. */
-export async function setCardShowSourceInPractice(blockId: string, show: boolean): Promise<PageBlock> {
-  const { data, error } = await supabase.from('cards').update({ show_source_in_practice: show }).eq('id', blockId).select().single();
+export type SourceVisibilityField = 'show_source_in_practice' | 'show_source_in_study';
+
+/** Per-card choice: whether Practice or Study mode shows this card's source image alongside it — independent of include_in_practice, and independent of the other mode's own toggle (see show_source_in_practice / show_source_in_study on PageBlock). */
+export async function setCardShowSource(blockId: string, field: SourceVisibilityField, show: boolean): Promise<PageBlock> {
+  const patch = field === 'show_source_in_practice' ? { show_source_in_practice: show } : { show_source_in_study: show };
+  const { data, error } = await supabase.from('cards').update(patch).eq('id', blockId).select().single();
   if (error) throw error;
   return data;
 }
@@ -428,6 +431,28 @@ export async function sendPageBlocksToPractice(pageId: string): Promise<{ sent: 
   if (updateError) throw updateError;
 
   return { sent: toSend.length, alreadySent: blocks.length - toSend.length };
+}
+
+/** Bulk version of setCardShowSource — sets the given field for every one of a page's current blocks in one shot (the "Show/Hide source for all" toolbar actions — one pair for Practice, one for Study). Skips blocks already at the target value. */
+export async function setPageBlocksShowSource(pageId: string, field: SourceVisibilityField, show: boolean): Promise<{ updated: number }> {
+  const { data: blocks, error: blocksError } = await supabase.from('cards').select('id, show_source_in_practice, show_source_in_study').eq('source_page_id', pageId);
+  if (blocksError) throw blocksError;
+  if (!blocks?.length) return { updated: 0 };
+
+  const toUpdate = blocks.filter((b) => b[field] !== show);
+  if (!toUpdate.length) return { updated: 0 };
+
+  const patch = field === 'show_source_in_practice' ? { show_source_in_practice: show } : { show_source_in_study: show };
+  const { error: updateError } = await supabase
+    .from('cards')
+    .update(patch)
+    .in(
+      'id',
+      toUpdate.map((b) => b.id),
+    );
+  if (updateError) throw updateError;
+
+  return { updated: toUpdate.length };
 }
 
 /** The reverse of sendPageBlocksToPractice — pulls this page's cards back out of practice. FSRS scheduling state is left untouched (only include_in_practice flips off), so re-including later just resumes wherever the card's due/state already were. */

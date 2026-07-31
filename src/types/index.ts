@@ -26,6 +26,8 @@ export type UserRole = 'admin' | 'student';
 export type Profile = {
   id: string;
   role: UserRole;
+  /** User-chosen name shown as deck author on a public deck. Null until set (see set_my_display_name RPC). */
+  display_name: string | null;
   created_at: string;
 };
 
@@ -44,6 +46,8 @@ export type Deck = {
   desired_retention: number;
   visibility: DeckVisibility;
   status: DeckStatus;
+  /** Owner-controlled: when true (and status='published'), readable by every authenticated user and returned by search_public_decks. Independent of the admin-curated 'shared' visibility system. */
+  is_public: boolean;
   created_at: string;
 };
 
@@ -56,6 +60,16 @@ export type DeckUpdate = Partial<Omit<Deck, 'id' | 'user_id' | 'created_at'>>;
 export type DeckWithCounts = Deck & {
   _due: number;
   _new: number;
+};
+
+/** One row of the search_public_decks RPC result — a public deck plus its author's display name and total card count. */
+export type PublicDeckSearchResult = {
+  id: string;
+  name: string;
+  created_at: string;
+  user_id: string;
+  author_display_name: string | null;
+  card_count: number;
 };
 
 // ---------- review/confidence metadata ----------
@@ -347,8 +361,8 @@ export type PageBlockContent =
 
 export type PageBlockKind = 'document' | 'interaction' | 'image_ref' | 'audio_ref';
 
-/** Visual-only provisioning (section 8/9 of the Read Mode spec) — no grading, no real audio wiring in this slice. */
-export type AnswerKeyStatus = 'available' | 'unavailable' | 'unknown';
+/** 'available': confirmed by the attached answer key. 'inferred': the answer key didn't cover this item, but the model was confident enough (an objective/mechanical answer — grammar, vocabulary, arithmetic) to answer it itself — never presented as key-confirmed, see the distinct Verify labeling in readModeRenderers.ts. 'unavailable': neither the key nor confident inference covers it. 'unknown': no key attached at all. */
+export type AnswerKeyStatus = 'available' | 'unavailable' | 'unknown' | 'inferred';
 export type ActivityAudioReference = { label: string; status: 'matched' | 'unresolved' | 'unavailable' } | null;
 
 /** 'manual' = a plain authored/pasted card (fields below); 'textbook_extraction' = faithful, source-bound content from the import pipeline. The two content shapes below coexist on one row rather than being forced into a common shape — never assume both halves are populated at once. */
@@ -387,8 +401,10 @@ export type PageBlock = {
   activity_audio_reference: ActivityAudioReference;
   needs_review: boolean | null;
   review_reason: string | null;
-  /** Per-card choice: when true and a source image exists, Study/Practice shows it alongside the card — defaults true so existing extracted cards keep today's always-shown behavior until someone opts out. Meaningless for a card with no source (origin='manual'). */
+  /** Per-card choice: when true and a source image exists, Practice mode shows it alongside the card — defaults true so existing extracted cards keep today's always-shown behavior until someone opts out. Independent of show_source_in_study (Study mode has its own separate toggle). Meaningless for a card with no source (origin='manual'). */
   show_source_in_practice: boolean;
+  /** Same idea as show_source_in_practice but scoped to Study mode only — the two are independent so an admin can show the source page while studying without cluttering Practice, or vice versa. */
+  show_source_in_study: boolean;
   /** The learner's own in-progress answer for an interactive card (single_choice/matching_pairs/text_input/etc.), captured live in Study mode so it survives a re-render, a page reload, or coming back to this card later — see captureAnswerState/applyAnswerState in readModeRenderers.ts. Shape is recipe-specific (an internal detail of those two functions), never read/written anywhere else. Null when nothing's been entered yet, or for a recipe with nothing to capture. */
   study_answer: Record<string, unknown> | null;
 
@@ -821,6 +837,7 @@ export type Database = {
         Update: Partial<
           Pick<
             PageExtraction,
+            | 'name'
             | 'status'
             | 'model'
             | 'prompt_version'
@@ -883,6 +900,14 @@ export type Database = {
       approve_page_extraction: {
         Args: { p_page_extraction_id: string; p_force?: boolean; p_override_reason?: string | null };
         Returns: PageExtraction;
+      };
+      search_public_decks: {
+        Args: { p_query?: string | null };
+        Returns: PublicDeckSearchResult[];
+      };
+      set_my_display_name: {
+        Args: { p_display_name: string | null };
+        Returns: Profile;
       };
     };
   };

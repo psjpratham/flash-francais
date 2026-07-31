@@ -1,8 +1,8 @@
-import { deleteImportCompletely, listImportsForDeck } from '../lib/imports';
+import { deleteImportCompletely, listImportsForDeck, renameImport } from '../lib/imports';
 import { computeTextbookImportProgress, type TextbookImportProgress } from '../lib/importProgress';
-import { listStackTilesForDeck, type StackTile } from '../lib/stacks';
+import { listStackTilesForDeck, renameStack, type StackTile } from '../lib/stacks';
 import type { Import } from '../types';
-import { $, confirmDialog, errMsg, esc, toast } from '../lib/dom';
+import { $, confirmDialog, errMsg, esc, promptDialog, toast } from '../lib/dom';
 
 export interface StacksListDeps {
   onBack: () => void;
@@ -117,7 +117,8 @@ export async function renderStacksList(container: HTMLElement, deps: StacksListD
           <span class="${allIncluded ? 'stack-card-all-in' : noneIncluded ? 'stack-card-none-in' : ''}">${tile.includedCount}/${tile.cardCount} queued in Practice Mode</span>
         </div>
         <div class="stack-card-actions">
-          <button class="btn-sec" data-manage="${esc(tile.id)}" ${canManage ? '' : 'disabled title="Coming soon"'}>✎ Manage</button>
+          <button class="btn-sec" data-manage="${esc(tile.id)}" ${canManage ? '' : 'disabled title="Coming soon"'}>📝 Manage</button>
+          <button class="btn-sec" data-rename="${esc(tile.id)}" title="Rename this ${tile.isImport ? 'import' : 'stack'}">✎ Rename</button>
           ${tile.isImport ? `<button class="btn-sec" data-delete-import="${esc(tile.id)}" ${deleting ? 'disabled' : ''} title="Delete this import and every card it produced">${deleting ? '…' : '🗑 Delete'}</button>` : ''}
         </div>
       </div>`;
@@ -138,6 +139,24 @@ export async function renderStacksList(container: HTMLElement, deps: StacksListD
     container.querySelectorAll<HTMLButtonElement>('[data-delete-import]').forEach((btn) => {
       btn.addEventListener('click', () => void doDeleteImport(btn.dataset.deleteImport!));
     });
+    container.querySelectorAll<HTMLButtonElement>('[data-rename]').forEach((btn) => {
+      btn.addEventListener('click', () => void doRename(btn.dataset.rename!));
+    });
+  }
+
+  async function doRename(tileId: string): Promise<void> {
+    const tile = tiles?.find((t) => t.id === tileId);
+    if (!tile) return;
+    const name = await promptDialog(`Rename "${tile.name}"`, tile.name);
+    if (!name || name === tile.name) return;
+    try {
+      if (tile.isImport) await renameImport(tile.id, name);
+      else await renameStack(tile.stackIds[0], name);
+      toast('Renamed.');
+      await load();
+    } catch (e) {
+      toast('Could not rename: ' + errMsg(e));
+    }
   }
 
   async function doDeleteImport(importId: string): Promise<void> {

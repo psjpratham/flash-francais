@@ -50,12 +50,14 @@ function jobRow(job: JobRowData): string {
     </tr>`;
 }
 
-/** Admin/owner-only deep-dive — never rendered for a non-owner (gated by the caller, not by this function). One row per page job, never called a "lesson" or "chunk". */
-export function renderAdminDiagnostics(d: ImportDiagnostics): string {
+/**
+ * Everyone's (learner-safe) view: status, timing, page/review counts —
+ * nothing about which LLM/model ran or what it cost. Shown to any owner of
+ * this import, not gated.
+ */
+export function renderImportDetailsSummary(d: ImportDiagnostics): string {
   return `
     <div class="diag-summary">
-      <div><span>Import ID</span>${esc(d.importId)}</div>
-      <div><span>Deck ID</span>${esc(d.deckId)}</div>
       <div><span>Status</span>${esc(d.status)}</div>
       <div><span>Current stage</span>${esc(d.currentStage)}</div>
       <div><span>Created</span>${fmtTime(d.createdAt)}</div>
@@ -73,6 +75,20 @@ export function renderAdminDiagnostics(d: ImportDiagnostics): string {
       <div><span>Pages rendered</span>${d.pagesRendered} / ${d.totalPages ?? '?'}</div>
       ${d.preprocessingError ? `<div><span>Preprocessing error</span>${esc(d.preprocessingError)}</div>` : ''}
       <div><span>Review status</span>${d.reviewCounts.approved} approved · ${d.reviewCounts.needsReview} need review · ${d.reviewCounts.failed} failed · ${d.reviewCounts.pending} pending</div>
+    </div>`;
+}
+
+/**
+ * Admin-only deep-dive, on top of the learner-safe summary above — never
+ * rendered for a non-admin (gated by the caller, not by this function).
+ * Internal ids plus one row per page job, including the model/token/cost
+ * details a learner has no reason to see. Never called a "lesson" or "chunk".
+ */
+export function renderAdminJobsTable(d: ImportDiagnostics): string {
+  return `
+    <div class="diag-summary">
+      <div><span>Import ID</span>${esc(d.importId)}</div>
+      <div><span>Deck ID</span>${esc(d.deckId)}</div>
     </div>
     <div class="diag-table-wrap">
       <table class="diag-table">
