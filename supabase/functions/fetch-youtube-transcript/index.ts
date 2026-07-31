@@ -83,15 +83,21 @@ async function fetchTranscript(youtubeUrl: string, apiKey: string): Promise<{ tr
   if (!res.ok) throw new Error(messageForStatus(res.status, body));
 
   const segments = Array.isArray(body.transcript) ? body.transcript : [];
-  // Segments are short caption-line fragments, not sentences — joined with a
-  // single space each, then whitespace-collapsed, so the result reads as one
-  // continuous document (what the downstream card-generation prompt expects),
-  // not a list of disconnected phrases.
+  // One real newline PER SEGMENT — critical, not cosmetic: the extraction
+  // pipeline's chunker (sourceLines.ts's toSourceLines) splits a page's text
+  // into ~6000-char requests by splitting on '\n' alone. Flattening every
+  // segment into one space-joined blob (the previous approach) produced a
+  // transcript with zero newlines, so a multi-minute video became a single
+  // oversized request instead of many small ones — Gemini then timed out
+  // generating a response for it (see gemini.ts's 60s REQUEST_TIMEOUT_MS).
+  // Each segment's OWN internal whitespace (a caption line can itself
+  // contain a '\n', e.g. "You know the rules\nand so do I") is still
+  // collapsed to a single space — only the boundary BETWEEN segments must
+  // survive as a real line break.
   const transcript = segments
-    .map((s) => (typeof s.text === 'string' ? s.text : ''))
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .map((s) => (typeof s.text === 'string' ? s.text.replace(/\s+/g, ' ').trim() : ''))
+    .filter(Boolean)
+    .join('\n');
   if (!transcript) throw new Error('This video’s transcript came back empty.');
 
   return { transcript, title: body.metadata?.title?.trim() || `YouTube video ${body.video_id}`, videoId: body.video_id };
