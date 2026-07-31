@@ -94,9 +94,23 @@ async function fetchTranscript(youtubeUrl: string, apiKey: string): Promise<{ tr
   // contain a '\n', e.g. "You know the rules\nand so do I") is still
   // collapsed to a single space — only the boundary BETWEEN segments must
   // survive as a real line break.
+  //
+  // Only s.text is ever read here — start/duration/every other field on a
+  // segment is discarded, and nothing from the response envelope (video_id,
+  // language, metadata) ends up in this string either. This is already a
+  // parsed plain-text transcript, never the raw API JSON.
+  //
+  // Auto-captions also carry real noise worth stripping before this becomes
+  // a "document" for card generation: bracketed non-speech markers
+  // ("[Musique]", "[Applause]", "[Music]", …) are YouTube's own
+  // sound-effect/music annotations, not transcript content — verified
+  // directly against a real response (this exact video has 10 of them). Left
+  // in, they read as literal source lines a faithful/exhaustive prompt would
+  // try to make a card out of.
+  const NON_SPEECH_MARKER = /^\[[^\]]+\]$/;
   const transcript = segments
     .map((s) => (typeof s.text === 'string' ? s.text.replace(/\s+/g, ' ').trim() : ''))
-    .filter(Boolean)
+    .filter((line) => line && !NON_SPEECH_MARKER.test(line))
     .join('\n');
   if (!transcript) throw new Error('This video’s transcript came back empty.');
 
