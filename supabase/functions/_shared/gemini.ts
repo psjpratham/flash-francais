@@ -24,7 +24,17 @@ const DEFAULT_MODEL = 'gemini-flash-lite-latest';
 // alone add real weight per block). 24576 leaves comfortable headroom above
 // the ~8000 tokens that page actually needed once given room to finish.
 const DEFAULT_MAX_OUTPUT_TOKENS = 24576;
-const REQUEST_TIMEOUT_MS = 60_000;
+// 60s was too tight for a genuinely dense generation — verified directly:
+// a YouTube-transcript chunk asking for a card per phrase (~214 short
+// caption lines in one chunk, "create cards for all the phrases mentioned
+// in the video") reliably hit exactly 60.0s and failed with
+// provider_timeout, while ordinary textbook-page extractions complete in
+// 7-11s. 100s leaves ~50s of margin under Supabase Edge Functions' 150s
+// free-tier wall-clock ceiling (docs.supabase.com/guides/functions/limits)
+// even accounting for the rest of processClaimedExtractionJob's overhead
+// in the same invocation — going much higher risks the whole dispatcher
+// invocation getting killed by the platform instead of failing gracefully.
+const REQUEST_TIMEOUT_MS = 100_000;
 
 export interface ProviderUsage {
   promptTokens?: number;
