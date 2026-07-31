@@ -489,6 +489,18 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
     return { claimed: true, jobId: job.id, error: 'write_failed' };
   }
 
+  // Everything from here to the end of the function was previously
+  // UNPROTECTED — any uncaught exception anywhere in extraction, the
+  // audit/repair loop, the polish pass, or the block insert would propagate
+  // straight up through processExtractionJobsBatch's Promise.all with
+  // fail_job never called, leaving the job stuck in 'processing' forever
+  // with no error recorded at all. Confirmed this gap exists independently
+  // of the timeout/chunk-size tuning elsewhere in this file — a genuinely
+  // silent, undiagnosable failure mode, not just a slow-call problem. This
+  // try/catch is the actual fix for "goes stale with zero explanation":
+  // whatever throws, fail_job now always gets a real, specific error
+  // message instead of the job just disappearing into the void.
+  try {
   const sourceLines = page.text ? toSourceLines(page.text) : [];
   const imageRegions = (Array.isArray(page.image_regions) ? page.image_regions : []) as ImageRegionInput[];
   // Best-effort: a page with no slice (pdf-lib couldn't parse the source
@@ -760,28 +772,17 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
   await maybeFinalizeImport(supabase, importId);
 
   return { claimed: true, jobId: job.id };
-}
-
-// A healthy job should never be 'processing' anywhere near this long — the
-// per-call timeout (gemini.ts) plus this file's own budgets bound normal
-// completion well under it. Matches the client-side STALE_AFTER_MS
-// (src/lib/pageExtractions.ts) that the "Requeue stale jobs" admin button
-// already uses, so this is the same threshold, just applied automatically
-// instead of requiring someone to notice and click a button.
-export const EXTRACTION_STALE_AFTER_MS = 5 * 60 * 1000;
-
-/** Requeues extract_page jobs orphaned in 'processing' beyond EXTRACTION_STALE_AFTER_MS — was previously ONLY handled by an admin manually clicking "Requeue stale jobs" (src/lib/pageExtractions.ts's requeueStaleExtractionJobs); a job the platform killed mid-flight (no graceful error — see MAX_CHARS_PER_REQUEST's comment above) would otherwise sit stuck forever without one. Mirrors preprocessWorker.ts's requeueStalePreprocessJobs. Fallback only — the chunk/job time budgets above should make an actual platform kill rare now. */
-export async function requeueStaleExtractionJobs(supabase: SupabaseClient): Promise<number> {
-  const thresholdISO = new Date(Date.now() - EXTRACTION_STALE_AFTER_MS).toISOString();
-  const { data, error } = await supabase
-    .from('jobs')
-    .update({ status: 'queued', started_at: null })
-    .eq('type', 'extract_page')
-    .eq('status', 'processing')
-    .or(`started_at.lt.${thresholdISO},and(started_at.is.null,created_at.lt.${thresholdISO})`)
-    .select('id');
-  if (error) return 0;
-  return data?.length ?? 0;
+  } catch (e) {
+    // The catch this whole block exists for — see the comment above the
+    // try. Always records a real, specific reason (never leaves the job
+    // silently stuck), and the fail_job/finalize calls are themselves
+    // best-effort so a failure recording the failure can't compound into
+    // the same silent-stuck-forever problem this exists to prevent.
+    const message = e instanceof Error ? e.message : String(e);
+    await supabase.rpc('fail_job', { p_job_id: job.id, p_error: `unhandled: ${message}`.slice(0, 2000) }).catch(() => {});
+    await maybeFinalizeImport(supabase, importId).catch(() => {});
+    return { claimed: true, jobId: job.id, error: message };
+  }
 }
 
 export async function processOneExtractionJob(supabase: SupabaseClient): Promise<ExtractResult> {
