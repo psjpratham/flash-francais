@@ -1100,3 +1100,12 @@ input.read-verify-incorrect,textarea.read-verify-incorrect{border:1.5px solid va
   .page-review-right{position:static}
 }
 .accent-hint{font-size:11.5px;color:var(--ink-faint);margin-top:10px;text-align:center}
+
+/* iOS Safari auto-zooms the page on focusing any text input/textarea whose
+   computed font-size is under 16px — exactly what these activity-card entry
+   fields were set to. Bumping to 16px only below the mobile breakpoint (not
+   globally) keeps the desktop compact look and, unlike viewport
+   maximum-scale=1, doesn't disable the user's own pinch-zoom. */
+@media (max-width:860px){
+  .read-text-entry,.read-inline-blank,.read-mte-input,.read-long-writing,.composed-input{font-size:16px}
+}
