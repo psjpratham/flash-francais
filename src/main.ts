@@ -50,6 +50,8 @@ let disposeSession: (() => void) | null = null;
 let disposeImportDetail: (() => void) | null = null;
 /** Purely a UI-visibility flag now (admin-only monitoring panel) — doesn't gate import capability, see 20260812000000_retire_admin_role.sql. */
 let isAdmin = false;
+/** Fires once per app load, from library's onStatsLoaded rather than route() itself — the streak badge arriving later grows #topRight, and since .top-right-group is right-aligned (margin-left:auto), that shifts the theme toggle left. Pinning the hint before that settles strands it at the toggle's pre-shift position. */
+let themeHintShown = false;
 
 function renderHeader(session: Session | null, streak?: number): void {
   if (!session) {
@@ -133,7 +135,14 @@ function renderView(session: Session): void {
         renderView(session);
       },
       onStudyAll: () => void startGlobalSession(session),
-      onStatsLoaded: (_totalDue, streakCurrent) => renderHeader(session, streakCurrent),
+      onStatsLoaded: (_totalDue, streakCurrent) => {
+        renderHeader(session, streakCurrent);
+        if (!themeHintShown) {
+          themeHintShown = true;
+          const themeSwitch = document.querySelector<HTMLElement>('.theme-switch');
+          if (themeSwitch) pinToast(themeSwitch, 'Try the dark / light mode', 3000);
+        }
+      },
     });
     return;
   }
@@ -331,8 +340,6 @@ function route(session: Session | null): void {
     history.replaceState(null, '', window.location.pathname); // drop the #access_token=... fragment from the address bar
     toast('Email confirmed — you’re all set!');
   }
-  const themeSwitch = document.querySelector<HTMLElement>('.theme-switch');
-  if (themeSwitch) pinToast(themeSwitch, 'Try the dark / light mode', 3000);
   isAdmin = false;
   getMyRole()
     .then((role) => {

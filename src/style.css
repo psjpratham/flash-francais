@@ -106,14 +106,15 @@ button:focus-visible,[tabindex]:focus-visible,input:focus-visible,textarea:focus
    component, not a plain icon button that just relabels itself on click. */
 .theme-switch{position:relative;display:inline-flex;width:50px;height:27px;flex:none;cursor:pointer}
 .theme-switch input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;z-index:2}
-.theme-switch-track{position:absolute;inset:0;background:var(--canvas);border:1px solid var(--line);border-radius:99px;display:flex;align-items:center;justify-content:space-between;padding:0 6px;transition:background .16s,border-color .16s}
-.theme-switch-icon{font-size:12px;line-height:1;opacity:.5;transition:opacity .16s}
+/* Same gradient as the accent-keyboard FAB (.accent-fab) so the toggle reads
+   as a distinct, colorful control instead of blending into the navbar. */
+.theme-switch-track{position:absolute;inset:0;background:linear-gradient(145deg,var(--indigo),var(--pink));border:1px solid transparent;border-radius:99px;display:flex;align-items:center;justify-content:space-between;padding:0 6px;transition:filter .16s,border-color .16s;box-shadow:0 4px 12px -4px rgba(75,75,247,.5)}
+.theme-switch-icon{font-size:12px;line-height:1;opacity:.85;transition:opacity .16s}
 .theme-switch-knob{position:absolute;top:2px;left:2px;width:21px;height:21px;border-radius:50%;background:var(--paper);box-shadow:0 1px 3px rgba(22,26,46,.28);transition:transform .18s cubic-bezier(.3,.9,.3,1)}
-.theme-switch input:checked ~ .theme-switch-track{background:var(--chip-dark);border-color:var(--chip-dark)}
 .theme-switch input:checked ~ .theme-switch-track .theme-switch-knob{transform:translateX(23px)}
-.theme-switch input:checked ~ .theme-switch-track .theme-switch-icon.sun{opacity:.35}
-.theme-switch input:not(:checked) ~ .theme-switch-track .theme-switch-icon.moon{opacity:.35}
-.theme-switch:hover .theme-switch-track{border-color:var(--indigo)}
+.theme-switch input:checked ~ .theme-switch-track .theme-switch-icon.sun{opacity:.4}
+.theme-switch input:not(:checked) ~ .theme-switch-track .theme-switch-icon.moon{opacity:.4}
+.theme-switch:hover .theme-switch-track{filter:brightness(1.08)}
 .gstat{display:flex;align-items:center;gap:6px;background:var(--canvas);border-radius:99px;padding:6px 13px;font-size:13px;font-weight:500;white-space:nowrap}
 .gstat .v{font-family:'IBM Plex Mono',monospace;font-weight:600}
 .avatar{width:31px;height:31px;border-radius:99px;background:var(--indigo-soft);color:var(--indigo);display:grid;place-items:center;font-size:12.5px;font-weight:600;flex:none;cursor:pointer}
