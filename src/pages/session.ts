@@ -6,7 +6,7 @@ import type { CardFlashcardContent, CardWithNote, Deck, DeckStatsWithStreak, Not
 import { $, esc, errMsg, toast } from '../lib/dom';
 import { barRow } from './statsPanel';
 import { PROFILES, type ChipAs, type ProfileChip } from '../lib/profiles';
-import { computeVerifyOutcome, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
+import { computeRevealOutcome, getQuestionText, getRevealAnswerText, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
 import { getRenderedPageUrl } from '../lib/pageRender';
 
 export interface SessionDeps {
@@ -181,9 +181,9 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       </aside>`;
   }
 
-  /** An imported card's own rendered-block content — goes inside the flip/swipe card exactly like any other card's face. The source page image (when this card's "show source in practice" toggle is on) is deliberately NOT part of this — see sourceImagePaneHTML — so the swipe-to-grade drag only ever moves the small text card, never a full page image alongside it. */
-  function importedCardBodyHTML(sourceBlock: CardWithNote): string {
-    return `<div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true)}</div>`;
+  /** An imported card's own rendered-block content — goes inside the flip/swipe card exactly like any other card's face. The source page image (when this card's "show source in practice" toggle is on) is deliberately NOT part of this — see sourceImagePaneHTML — so the swipe-to-grade drag only ever moves the small text card, never a full page image alongside it. `showRevealButton` is true only for a generation-mode 'other' card (see revealGeneratedOther) — its Verify button is an optional self-check, never a gate on grading. */
+  function importedCardBodyHTML(sourceBlock: CardWithNote, showRevealButton = false): string {
+    return `<div class="session-imported-left" data-read-block-id="${esc(sourceBlock.id)}">${renderReadModeBlock(sourceBlock, new Map(), true, showRevealButton)}</div>`;
   }
 
   /** The source page image for a card with "show source in practice" on, rendered as its own panel beside the flip/swipe card (see session-study-row) rather than inside it — dragging/grading the card never touches this pane. Null when the toggle is off or there's no image (yet). */
@@ -204,17 +204,24 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
 
     const card = queue[pos];
     // Every generation-mode card (prompt_generated) flips and gets graded —
-    // a 'flashcard'-recipe card the classic way (front/back text swap); any
-    // other recipe (single_choice, matching_pairs, text_input, etc.) by
-    // showing its interactive widget up front, letting the learner attempt
-    // it, then revealing correct/incorrect in place on "Show answer" (see
-    // flip()/revealGeneratedOther below) before grading. A faithful-
+    // a 'flashcard'-recipe card the classic way (front/back text swap); a
+    // non-flashcard recipe (single_choice, matching_pairs, text_input, etc.)
+    // shows its interactive widget up front, letting the learner attempt it,
+    // then flips to a real back face — question + correct answer only, same
+    // mechanics as any other flashcard — whenever there's an actual answer
+    // to show (hasRevealBack, gated by getRevealAnswerText the same way the
+    // Reveal/Verify buttons are). Without an answer key there's nothing to
+    // put on a back face, so that subset falls back to the older in-place
+    // reveal (see flip()/revealGeneratedOther below): correct/incorrect
+    // marked directly on the same live widget, no real flip. A faithful-
     // extraction card has nothing invented to hide behind a "reveal" step —
     // it always renders already-flipped, straight into grading, exactly as
     // before.
     const isGenerated = card.origin === 'textbook_extraction' && card.prompt_generated;
     const isFlashcard = isGenerated && card.component_type === 'flashcard';
     const isGeneratedOther = isGenerated && !isFlashcard;
+    const revealAnswerText = isGeneratedOther ? getRevealAnswerText(card) : null;
+    const hasRevealBack = isGeneratedOther && revealAnswerText != null;
     const sourceBlock = card.origin === 'textbook_extraction' && !isGenerated ? card : null;
     const fields = card.fields ?? {};
     const flashcardContent = isFlashcard ? (card.content as CardFlashcardContent) : null;
@@ -228,7 +235,8 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     const isAiWrittenTag = (card.tags || []).includes('generated');
     if (sourceBlock) flipped = true;
     const importedFaceHTML = sourceBlock ? importedCardBodyHTML(sourceBlock) : '';
-    const generatedOtherFaceHTML = isGeneratedOther ? importedCardBodyHTML(card) : '';
+    const generatedOtherFaceHTML = isGeneratedOther ? importedCardBodyHTML(card, true) : '';
+    const generatedOtherQuestion = hasRevealBack ? getQuestionText(card) : '';
     // The source page image (when its own toggle is on) always renders as a panel
     // beside the card, never inside the flip/swipe element itself — see
     // sourceImagePaneHTML's doc comment for why.
@@ -254,12 +262,22 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
           <div class="zone" id="zone">
             ${showSwipeHint ? SWIPE_HINT_HTML : ''}
             <div class="verdict" id="verdict"><span id="verdictTxt"></span></div>
-            <div class="card ${flipped && !sourceBlock ? 'flipped' : ''} ${sourceBlock || isGeneratedOther ? 'session-card-imported' : ''} ${isFlashcard ? 'pf-card-tall' : ''}" id="card">
+            <div class="card ${flipped && !sourceBlock && (!isGeneratedOther || hasRevealBack) ? 'flipped' : ''} ${sourceBlock || isGeneratedOther ? 'session-card-imported' : ''} ${hasRevealBack ? 'session-card-flippable' : ''} ${isFlashcard ? 'pf-card-tall' : ''}" id="card">
               ${
                 sourceBlock
                   ? `<div class="face front">${importedFaceHTML}</div>`
                   : isGeneratedOther
-                    ? `<div class="face front">${generatedOtherFaceHTML}</div>`
+                    ? hasRevealBack
+                      ? `
+              <div class="face front">${generatedOtherFaceHTML}</div>
+              <div class="face back">
+                <div class="ctype">${esc(card.note_type ?? 'basic')}</div>
+                <div class="center">
+                  ${generatedOtherQuestion ? `<div class="word small">${esc(generatedOtherQuestion).replace(/\n/g, '<br>')}</div>` : ''}
+                  <div class="gloss">${esc(revealAnswerText ?? '').replace(/\n/g, '<br>')}</div>
+                </div>
+              </div>`
+                      : `<div class="face front">${generatedOtherFaceHTML}</div>`
                     : isFlashcard
                       ? `
               <div class="face front">
@@ -329,16 +347,20 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       $(container, '#flipBtn').addEventListener('click', flip);
     }
 
-    // The interactive widget itself is wired regardless of flip state — the
-    // learner attempts it BEFORE flipping (that's the whole point), and
-    // flip() reveals correct/incorrect on this same live DOM rather than
-    // re-rendering, so wiring only needs to happen once, here.
+    // The interactive widget on the front is wired regardless of flip state
+    // — the learner attempts it BEFORE flipping (that's the whole point).
+    // For hasRevealBack, flip() just re-renders (a real back face, same as
+    // any other flashcard) so this rewires a fresh front on every render;
+    // for the in-place fallback, flip() never re-renders (revealGeneratedOther
+    // mutates this same live DOM instead, to avoid losing the attempt), so
+    // this only ever runs once, pre-flip.
     if (isGeneratedOther) {
       container.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => wireReadModeBlock(card, el));
+      container.querySelector<HTMLButtonElement>('[data-reveal-block]')?.addEventListener('click', flip);
     }
     if (isFlashcard) wirePronunciationIcons(container);
 
-    attachInteractions(isGeneratedOther);
+    attachInteractions(isGeneratedOther && !flipped, isGeneratedOther && !hasRevealBack);
   }
 
   function renderDone(): void {
@@ -407,14 +429,29 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
    * learner's current attempt in place via the same logic Manage's Verify
    * button uses, then swaps the flip-cta for grade buttons. Deliberately NOT
    * a full render(): that would replace the widget's DOM and lose whatever
-   * the learner picked/typed.
+   * the learner picked/typed. Also re-enables the swipe/drag gesture
+   * (suppressed up to now so dragging the card didn't fight with clicking
+   * choice buttons / typing — see attachInteractions) so grading works by
+   * swipe here exactly like a flashcard, not just via the grade buttons.
    */
   function revealGeneratedOther(card: CardWithNote): void {
     const el = container.querySelector<HTMLElement>('[data-read-block-id]');
-    if (el) computeVerifyOutcome(card, el);
+    if (el) {
+      const outcome = computeRevealOutcome(card, el);
+      const area = el.querySelector<HTMLElement>('[data-feedback-area]');
+      if (area && outcome) {
+        area.hidden = false;
+        area.classList.remove('correct', 'incorrect', 'revealed');
+        area.classList.add(outcome.revealed ? 'revealed' : outcome.correct ? 'correct' : 'incorrect');
+        area.textContent = outcome.revealed ? outcome.summary : (outcome.correct ? '✓ ' : '✗ ') + outcome.summary;
+      }
+    }
+    const revealBtn = container.querySelector<HTMLButtonElement>('[data-reveal-block]');
+    if (revealBtn) revealBtn.disabled = true;
     const controls = document.getElementById('controls');
     if (controls) controls.innerHTML = GRADE_ROW_HTML;
     wireGradeButtons(card);
+    attachInteractions(false, true);
   }
 
   function flip(): void {
@@ -422,7 +459,8 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     flipped = true;
     const card = queue[pos];
     const isGeneratedOther = card.origin === 'textbook_extraction' && card.prompt_generated && card.component_type !== 'flashcard';
-    if (isGeneratedOther) {
+    const hasRevealBack = isGeneratedOther && getRevealAnswerText(card) != null;
+    if (isGeneratedOther && !hasRevealBack) {
       revealGeneratedOther(card);
     } else {
       render();
@@ -517,10 +555,65 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
    * explicit "Show answer" button and grade buttons work for these —
    * everything else here becomes a no-op.
    */
-  function attachInteractions(suppressGesture: boolean): void {
+  /**
+   * `singleFace` is true for a non-flashcard generation-mode card with no
+   * answer to put on a back face: it has only a `.face.front` (its "reveal"
+   * swaps in grade buttons + marks the answer in place, see
+   * revealGeneratedOther — there's no `.face.back` to rotate into view). The
+   * drag/snap transforms below normally add `rotateY(180deg)` once flipped
+   * so the CSS-flipped back face stays facing the viewer while being
+   * dragged; doing that here would just rotate the lone front face away
+   * from the viewer with nothing behind it, leaving a blank card. singleFace
+   * strips that rotation from every transform below.
+   *
+   * It also means this card's front — the same potentially-long interactive
+   * widget the learner was just answering — is still what's on screen after
+   * reveal, so it still needs to scroll (see .face's overflow:auto). A
+   * flashcard's short, fixed-layout back never needed this, which is why
+   * up/down swipes could freely claim every vertical drag for Hard/Easy —
+   * here that would swallow the exact gesture the learner needs for
+   * scrolling. So for singleFace only, a vertical-dominant drag is left
+   * alone entirely (no transform, no preventDefault, no grade) so it falls
+   * straight through to native scroll; only a horizontal-dominant drag is
+   * ever treated as a swipe.
+   */
+  function attachInteractions(suppressGesture: boolean, singleFace = false): void {
     const zone = document.getElementById('zone');
     if (!zone) return;
     const cardEl = document.getElementById('card');
+    const flipRotate = singleFace ? '' : 'rotateY(180deg)';
+
+    /** For singleFace, a drag that's currently more vertical than horizontal is a scroll attempt, not a swipe — see attachInteractions' own doc comment. */
+    function isScrollAttempt(dx: number, dy: number): boolean {
+      return singleFace && Math.abs(dy) >= Math.abs(dx);
+    }
+
+    /**
+     * touch-action CSS is just a hint the browser is free to interpret
+     * loosely — iOS Safari/Chrome have a long history of still scrolling
+     * the page out from under an active pointer drag regardless of it. The
+     * one thing that's actually guaranteed to stop it is calling
+     * preventDefault() inside a real, non-passive touchmove listener,
+     * hence duplicating the pointermove drag logic at the touch-event
+     * level purely to hold that veto (addEventListener's touchmove default
+     * is passive/uncancelable unless explicitly opted out here).
+     *
+     * Gated on `flipped` the same way pointermove's own card-drag effect
+     * is (dragging becomes true on every touchdown, flipped or not, so
+     * without this a card whose front-face content overflows — or an
+     * activity card, via suppressGesture — would lose the ability to
+     * scroll its own content the moment a finger merely touched it).
+     */
+    zone.addEventListener(
+      'touchmove',
+      (e: TouchEvent) => {
+        if (suppressGesture || !dragging || !flipped) return;
+        const t = e.touches[0];
+        if (t && isScrollAttempt(t.clientX - sx, t.clientY - sy)) return;
+        e.preventDefault();
+      },
+      { passive: false },
+    );
 
     zone.onpointerdown = (e: PointerEvent) => {
       if (suppressGesture) return;
@@ -545,10 +638,11 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       const dy = e.clientY - sy;
       if (Math.abs(dx) > 6 || Math.abs(dy) > 6) moved = true;
       if (!flipped) return;
+      if (isScrollAttempt(dx, dy)) return;
       const c = document.getElementById('card');
       const v = document.getElementById('verdict');
       if (!c || !v) return;
-      c.style.transform = `translate(${dx}px, ${Math.min(dy, 90)}px) rotate(${dx * 0.045}deg) rotateY(180deg)`;
+      c.style.transform = `translate(${dx}px, ${Math.min(dy, 90)}px) rotate(${dx * 0.045}deg) ${flipRotate}`;
       const g = swipeGrade(dx, dy);
       if (g === null) {
         v.style.opacity = '0';
@@ -563,7 +657,12 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       }
     };
 
-    function endDrag(e: PointerEvent): void {
+    /**
+     * A cancelled gesture (browser-initiated scroll takeover, system
+     * gesture, multi-touch, etc. — common on mobile) is never a completed
+     * swipe: it must always just snap the card back, never grade or flip.
+     */
+    function endDrag(e: PointerEvent, cancelled = false): void {
       if (suppressGesture) return;
       if (!dragging) return;
       dragging = false;
@@ -571,6 +670,10 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       const v = document.getElementById('verdict');
       if (c) c.classList.remove('dragging');
       if (v) v.style.opacity = '0';
+      if (cancelled) {
+        if (c) c.style.transform = flipped ? flipRotate : '';
+        return;
+      }
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
       if (!moved && !flipped) {
@@ -581,12 +684,13 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
         if (c) c.style.transform = '';
         return;
       }
+      if (isScrollAttempt(dx, dy)) return;
       const g = swipeGrade(dx, dy);
       if (g !== null) void grade((g + 1) as Rating);
-      else if (c) c.style.transform = 'rotateY(180deg)';
+      else if (c) c.style.transform = flipRotate;
     }
-    zone.onpointerup = endDrag;
-    zone.onpointercancel = endDrag;
+    zone.onpointerup = (e) => endDrag(e);
+    zone.onpointercancel = (e) => endDrag(e, true);
 
     if (cardEl) {
       cardEl.onclick = (e: MouseEvent) => {

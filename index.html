@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" href="/flash-card.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Flash Français</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -27,13 +27,29 @@
         }
       })();
     </script>
+    <!-- Supabase's email-confirmation redirect lands here with #access_token=...&type=signup
+         in the hash. supabase-js consumes and strips that hash asynchronously during client
+         init, so this flag has to be captured synchronously, before any module script runs,
+         or main.ts has no way to tell "just confirmed an email" apart from "returning user
+         with an existing session". -->
+    <script>
+      (function () {
+        try {
+          if (/type=signup/.test(window.location.hash)) {
+            sessionStorage.setItem('ff-auth-callback', '1');
+          }
+        } catch (e) {
+          /* sessionStorage unavailable — worst case, the confirmation toast is skipped */
+        }
+      })();
+    </script>
   </head>
   <body>
     <header class="top">
       <div class="top-in">
         <div class="brand">
-          <div class="brand-mark">F</div>
-          <div class="brand-name">Flash Francais</div>
+          <img class="brand-mark" src="/flash-card.png" alt="" />
+          <div class="brand-name">Flash Français</div>
         </div>
         <div class="top-right-group">
           <label class="theme-switch" title="Toggle dark mode">

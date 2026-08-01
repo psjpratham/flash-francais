@@ -94,7 +94,7 @@ button:focus-visible,[tabindex]:focus-visible,input:focus-visible,textarea:focus
   transition:background .15s,border-color .15s,box-shadow .15s;
 }
 .brand{display:flex;align-items:center;gap:10px;cursor:pointer}
-.brand-mark{width:31px;height:31px;border-radius:9px;background:linear-gradient(145deg,var(--indigo),var(--pink));display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px;font-family:'IBM Plex Serif',serif;flex:none}
+.brand-mark{width:31px;height:31px;object-fit:contain;flex:none}
 .brand-name{font-size:14.5px;font-weight:600;letter-spacing:-.01em;white-space:nowrap}
 /* Groups the persistent theme toggle with the session-dependent top-right
    content (#topRight gets its innerHTML wiped/rebuilt on every auth/route
@@ -117,8 +117,22 @@ button:focus-visible,[tabindex]:focus-visible,input:focus-visible,textarea:focus
 .gstat{display:flex;align-items:center;gap:6px;background:var(--canvas);border-radius:99px;padding:6px 13px;font-size:13px;font-weight:500;white-space:nowrap}
 .gstat .v{font-family:'IBM Plex Mono',monospace;font-weight:600}
 .avatar{width:31px;height:31px;border-radius:99px;background:var(--indigo-soft);color:var(--indigo);display:grid;place-items:center;font-size:12.5px;font-weight:600;flex:none;cursor:pointer}
-.signout{font-size:12.5px;color:var(--ink-faint)}
-.signout:hover{color:var(--ink)}
+/* Sign out lives behind the avatar now (click to open) rather than sitting
+   inline in the header at all times — that inline text was one more thing
+   competing for header width, which on a narrow phone screen was forcing
+   the whole navbar (and with it the page) to shrink to fit. */
+.avatar-menu{position:relative}
+.avatar-dropdown{
+  position:absolute;top:calc(100% + 8px);right:0;min-width:180px;
+  background:var(--paper);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);padding:8px;display:flex;flex-direction:column;gap:2px;
+  opacity:0;transform:translateY(-6px);pointer-events:none;
+  transition:opacity .15s,transform .15s;z-index:50;
+}
+.avatar-dropdown.open{opacity:1;transform:translateY(0);pointer-events:auto}
+.avatar-dropdown-email{font-size:11.5px;color:var(--ink-faint);padding:4px 10px 8px;border-bottom:1px solid var(--line);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.avatar-dropdown-item{font-size:13px;font-weight:600;color:var(--ink);text-align:left;padding:8px 10px;border-radius:8px;transition:background .12s,color .12s}
+.avatar-dropdown-item:hover{background:var(--red-soft);color:var(--red)}
 
 /* ===== shells ===== */
 .wrap{max-width:1100px;margin:0 auto;padding:26px 20px 60px}
@@ -421,6 +435,13 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
   .session{max-width:none;width:100%}
   .session-layout-wide .session{max-width:none}
 }
+/* Phones only (touch + narrow enough to exclude iPad, whose narrowest
+   portrait width is 768px) — the session stats sidebar just isn't worth the
+   space it costs on a practice screen this small. iPad keeps the row of
+   stat panels above from the max-width:860px rule. */
+@media (hover:none) and (pointer:coarse) and (max-width:767px){
+  .session-sidebar{display:none}
+}
 .sess-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:12px}
 .sess-pill{display:flex;align-items:center;gap:9px;background:var(--paper);border:1px solid var(--line);border-radius:99px;padding:6px 14px 6px 7px;font-size:12.5px;color:var(--ink-soft);min-width:0}
 .sess-pill .n{font-family:'IBM Plex Mono',monospace;font-weight:600;color:var(--ink);background:var(--canvas);border-radius:99px;padding:2px 9px;font-size:12px;flex:none}
@@ -430,7 +451,16 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
 .sessbar{height:5px;border-radius:99px;background:var(--line);overflow:hidden;margin-bottom:18px}
 .sessbar span{display:block;height:100%;background:var(--indigo);transition:width .35s cubic-bezier(.2,.8,.2,1)}
 
-.zone{perspective:1600px;position:relative;touch-action:pan-y}
+/* No touch-action restriction here (deliberately — see session.ts's
+   touchmove/preventDefault comment): touch-action is an ancestor-wide CSS
+   hint, so setting it to none here would override the more permissive
+   pan-y that some cards' inner .face sets below to stay scrollable
+   (touch-action is the *intersection* of an element's and all its
+   ancestors' values — the most restrictive one wins, no matter how deep
+   in the tree it's set). Blocking native scroll during an actual swipe is
+   instead handled precisely, only while it's needed, via a real
+   non-passive touchmove listener in JS. */
+.zone{perspective:1600px;position:relative}
 
 /* One-time-per-session swipe teaching overlay (session.ts's SWIPE_HINT_HTML)
    — purely decorative, pointer-events:none so it never intercepts the real
@@ -449,7 +479,7 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
 
 .verdict{position:absolute;inset:0;border-radius:var(--r-lg);pointer-events:none;opacity:0;transition:opacity .12s;display:grid;place-items:center;z-index:5}
 .verdict span{font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:9px 18px;border-radius:99px;color:#fff;transform:rotate(-4deg)}
-.card{position:relative;transform-style:preserve-3d;transition:transform .5s cubic-bezier(.3,.9,.3,1);min-height:300px}
+.card{position:relative;transform-style:preserve-3d;transition:transform .5s cubic-bezier(.3,.9,.3,1);min-height:246px}
 .card.flipped{transform:rotateY(180deg)}
 .card.dragging{transition:none}
 .face{position:absolute;inset:0;backface-visibility:hidden;background:var(--card-bg);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:24px;display:flex;flex-direction:column;overflow:hidden}
@@ -459,15 +489,51 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
    a normal card and scrollable if it runs long — never the page image itself
    (see session-study-row/session-source-pane below, and studyMode.ts's own
    split view for Study mode). */
-.card.session-card-imported{min-height:420px;max-height:74vh}
-.card.session-card-imported .face{padding:0;overflow:auto}
+.card.session-card-imported{min-height:344px;max-height:61vh}
+/* touch-action:pan-y: this face can run long and needs native
+   touch-scrolling, but left at the default 'auto' a horizontal swipe
+   here could get consumed as native panning instead of reaching our JS
+   swipe-to-grade logic. pan-y keeps vertical scrolling native while
+   leaving horizontal free for that. */
+.card.session-card-imported .face{padding:0;overflow:auto;touch-action:pan-y}
+/* The back face of a flipped session-card-imported card (hasRevealBack) is
+   short, static question+answer text, not the long scrollable widget the
+   padding:0 rule above exists for — restore normal card padding just for it. */
+.card.session-card-imported .face.back{padding:24px}
+
+/* A session-card-imported card with no real back face (session-card-flippable
+   absent — sourceBlock, or a generation-mode 'other' card with no answer key)
+   never flips; it only ever renders a single .face.front. There's no reason
+   for that lone face to be position:absolute (that's only needed to stack a
+   front+back pair for the flip illusion) — so instead of capping its height
+   and scrolling the overflow (which repeatedly hit a WebKit bug where touch
+   scroll silently dies on an overflow:auto region nested inside a
+   preserve-3d/backface-visibility:hidden context, no matter how that context
+   got flattened), let it flow normally: the card grows to fit its content
+   and the page scrolls, which is plain, unbuggy browser behavior. */
+.card.session-card-imported:not(.session-card-flippable){max-height:none}
+.card.session-card-imported:not(.session-card-flippable) .face{position:static;overflow:visible}
+
+/* session-card-flippable is the other case (isGeneratedOther WITH an
+   answer key): its .face.front is the same potentially-long interactive
+   widget as above and needs the exact same fix, but its .face.back is a
+   real second face that must stay position:absolute — that's what makes
+   it stack exactly behind the front and get caught by backface-visibility
+   until the card actually rotates. Only .front switches to static/in-flow
+   (letting .card and the page grow/scroll to fit it); .back is untouched
+   and still anchors to whatever box that static front ends up giving
+   .card. max-height only needs lifting pre-flip — once .flipped lands,
+   the back face (always short, static text) is what's showing, so the
+   normal cap back there is harmless. */
+.card.session-card-flippable:not(.flipped){max-height:none}
+.card.session-card-flippable .face.front{position:static;overflow:visible}
 .session-imported-left{padding:20px}
 
 /* Study mode's own split page-image + rendered-card view (studyMode.ts) —
    distinct from Practice mode's session-study-row/session-source-pane below,
    since Study mode never flips/swipes so the image can safely live inside
    the same panel as the card content. */
-.session-imported-split{display:flex;gap:0;height:100%;min-height:480px}
+.session-imported-split{display:flex;gap:0;height:100%;min-height:394px}
 .session-imported-split .session-imported-left{flex:1;min-width:0;overflow:auto}
 .session-imported-right{flex:1;min-width:0;overflow:auto;padding:20px;border-left:1px solid var(--line);display:flex;align-items:flex-start;justify-content:center;background:var(--canvas)}
 .session-imported-right img{max-width:100%;border-radius:var(--r-sm);border:1px solid var(--line)}
@@ -479,7 +545,7 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
    element, so grading-swipe only ever moves the small text card. */
 .session-study-row{display:flex;gap:20px;align-items:flex-start}
 .session-study-row .zone{flex:1;min-width:0}
-.session-source-pane{flex:1;min-width:0;background:var(--card-bg);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:16px;max-height:74vh;overflow:auto;display:flex;align-items:flex-start;justify-content:center}
+.session-source-pane{flex:1;min-width:0;background:var(--card-bg);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:16px;max-height:61vh;overflow:auto;display:flex;align-items:flex-start;justify-content:center}
 .session-source-pane img{max-width:100%;border-radius:var(--r-sm)}
 @media (max-width:860px){
   .session-study-row{flex-direction:column}
@@ -503,7 +569,7 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
    (via .center, unchanged), rich detail (examples especially, then
    ipa/rule/table/etc.) flows below it — this is the actual point of a
    flashcard back, not something hidden behind a click. */
-.card.pf-card-tall{min-height:480px}
+.card.pf-card-tall{min-height:394px}
 .face.back.pf-rich{overflow-y:auto;padding-bottom:22px}
 .pf-ipa{font-family:'IBM Plex Mono',monospace;font-size:14px;color:var(--ink-faint)}
 .pf-detail{width:100%;max-width:440px;margin:6px auto 0;display:flex;flex-direction:column;gap:14px;text-align:left}
@@ -581,7 +647,7 @@ kbd{font-family:'IBM Plex Mono',monospace;font-size:10.5px;background:var(--canv
 
 @media (max-width:640px){
   .face{padding:20px 18px}
-  .card{min-height:280px}
+  .card{min-height:230px}
 }
 
 /* ===== toast / spinner ===== */
@@ -989,7 +1055,10 @@ kbd{font-family:'IBM Plex Mono',monospace;font-size:10.5px;background:var(--canv
 .read-verify-btn:disabled{opacity:.5;cursor:not-allowed}
 .read-verify-btn-inferred{border-color:var(--amber);color:var(--amber-strong);background:var(--amber-soft)}
 .read-verify-note{font-size:12px;color:var(--ink-faint)}
+.read-reveal-btn{border-color:var(--indigo);color:var(--indigo)}
+.read-reveal-btn:disabled{opacity:.5;cursor:not-allowed;border-color:var(--line);color:inherit}
 .read-feedback-area{width:100%;font-size:13px;color:var(--ink-soft);background:var(--canvas);border-radius:var(--r-sm);padding:9px 12px}
+.read-feedback-area.revealed{color:var(--indigo);background:color-mix(in srgb,var(--indigo) 12%,var(--paper))}
 .read-feedback-area.correct{color:var(--green-strong);background:color-mix(in srgb,var(--green) 12%,var(--paper))}
 .read-feedback-area.incorrect{color:var(--amber-strong);background:color-mix(in srgb,var(--amber) 14%,var(--paper))}
 .read-verify-correct{border-color:var(--green) !important;background:color-mix(in srgb,var(--green) 14%,transparent) !important}

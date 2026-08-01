@@ -25,6 +25,7 @@ import type {
   AnswerKeyStatus,
   CardCategorizeContent,
   CardChoiceContent,
+  CardDialogueContent,
   CardFlashcardContent,
   CardFlashcardDetail,
   CardFlashcardExample,
@@ -177,8 +178,17 @@ function renderCardInstruction(block: PageBlock, suppress: boolean): string {
   return `<div class="read-card-instruction">${esc(block.instruction)}</div>`;
 }
 
-/** Visual-only "Verify" provisioning (spec section 8) — no grading logic. Status drives whether the button is enabled, never whether an answer is checked. */
-function renderVerifyArea(block: PageBlock): string {
+/**
+ * Visual-only "Verify" provisioning (spec section 8) — no grading logic.
+ * Status drives whether the button is enabled, never whether an answer is
+ * checked. `showRevealButton` (Practice/Study only, see renderReadModeBlock)
+ * adds a second "Reveal answer" button beside it, but only when `status`
+ * itself says there's actually something to reveal (available/inferred) —
+ * same condition that enables Verify. Unlike Verify, Reveal never requires
+ * an attempt first, but it's still nothing without an answer key or an
+ * AI-inferred answer behind it.
+ */
+function renderVerifyArea(block: PageBlock, showRevealButton: boolean): string {
   if (block.block_kind !== 'interaction') return '';
   const status: AnswerKeyStatus = block.answer_key_status ?? 'unknown';
   const cfg: Record<AnswerKeyStatus, { label: string; disabled: boolean; note: string; cls: string }> = {
@@ -191,6 +201,7 @@ function renderVerifyArea(block: PageBlock): string {
   const s = cfg[status];
   return `<div class="read-verify-area">
     <button type="button" class="btn-sec read-verify-btn ${s.cls}" data-verify-block="${esc(block.id)}" ${s.disabled ? 'disabled' : ''}>${esc(s.label)}</button>
+    ${showRevealButton && !s.disabled ? `<button type="button" class="btn-sec read-reveal-btn" data-reveal-block="${esc(block.id)}">Reveal answer</button>` : ''}
     ${s.note ? `<span class="read-verify-note">${esc(s.note)}</span>` : ''}
     <div class="read-feedback-area" data-feedback-area="${esc(block.id)}" hidden></div>
   </div>`;
@@ -219,7 +230,7 @@ function renderPronArea(block: PageBlock, recipe: string): string {
   return `<div class="read-pron-area">${pronIconHTML(text)}<span class="read-pron-label">Play pronunciation</span></div>`;
 }
 
-function renderCard(block: PageBlock, bodyHtml: string, showNumBadge: boolean, recipe: string): string {
+function renderCard(block: PageBlock, bodyHtml: string, showNumBadge: boolean, recipe: string, showRevealButton: boolean): string {
   const categoryAttr = block.category ? ` data-category="${esc(block.category)}"` : '';
   return `<div class="read-card" data-kind="${esc(block.block_kind ?? '')}"${categoryAttr}>
     ${renderCardHeader(block, showNumBadge, isTitleRedundant(block, recipe))}
@@ -227,7 +238,7 @@ function renderCard(block: PageBlock, bodyHtml: string, showNumBadge: boolean, r
     <div class="read-card-body">${bodyHtml}</div>
     ${renderPronArea(block, recipe)}
     ${renderTranslationToggle(block)}
-    ${renderVerifyArea(block)}
+    ${renderVerifyArea(block, showRevealButton)}
   </div>`;
 }
 
@@ -626,11 +637,13 @@ const INTERACTION_BODY_RENDERERS: Record<string, (b: PageBlock) => string> = {
  * card. Never crashes on a broken/unrecognized block — falls back to a
  * plain-text card. `showNumBadge` should be false when the previous block in
  * the page has the same section_number (a multi-card exercise split into
- * sub-question cards) — see renderCardHeader.
+ * sub-question cards) — see renderCardHeader. `showRevealButton` adds a
+ * "Reveal answer" button beside Verify — pass true only from a session
+ * context (Practice) that lets the learner move on without answering.
  */
-export function renderReadModeBlock(block: PageBlock, audioFilesById: Map<string, ImportAudioFile>, showNumBadge = true): string {
-  if (block.block_kind === 'image_ref') return renderCard(block, imageRefBody(block), showNumBadge, 'image_ref');
-  if (block.block_kind === 'audio_ref') return renderCard(block, audioRefBody(block, audioFilesById), showNumBadge, 'audio_ref');
+export function renderReadModeBlock(block: PageBlock, audioFilesById: Map<string, ImportAudioFile>, showNumBadge = true, showRevealButton = false): string {
+  if (block.block_kind === 'image_ref') return renderCard(block, imageRefBody(block), showNumBadge, 'image_ref', showRevealButton);
+  if (block.block_kind === 'audio_ref') return renderCard(block, audioRefBody(block, audioFilesById), showNumBadge, 'audio_ref', showRevealButton);
 
   const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
   const renderer = block.block_kind === 'interaction' ? INTERACTION_BODY_RENDERERS[recipe] : DOCUMENT_BODY_RENDERERS[recipe];
@@ -642,7 +655,7 @@ export function renderReadModeBlock(block: PageBlock, audioFilesById: Map<string
     const fallback = block.content as { text?: string };
     bodyHtml = `<div class="read-raw-text"><span class="read-raw-flag">Unstructured content</span><pre>${esc(fallback?.text ?? block.source_text ?? '')}</pre></div>`;
   }
-  return renderCard(block, bodyHtml, showNumBadge, recipe);
+  return renderCard(block, bodyHtml, showNumBadge, recipe, showRevealButton);
 }
 
 // ---------- wiring (interactivity + purely-visual affordances) ----------
@@ -695,6 +708,8 @@ function wireTranslationToggles(container: ParentNode): void {
 export interface VerifyOutcome {
   correct: boolean;
   summary: string;
+  /** True when `summary` is a plain answer reveal (no attempt to judge), not a right/wrong verdict on something the learner actually did — see computeRevealOutcome. Callers should style this distinctly from correct/incorrect. */
+  revealed?: boolean;
 }
 
 function normalizeAnswer(s: string): string {
@@ -1111,6 +1126,154 @@ export function computeVerifyOutcome(block: PageBlock, container: ParentNode): V
     default:
       return null;
   }
+}
+
+/**
+ * A plain "what's the correct answer" summary, independent of anything the
+ * learner did — the verify* functions above deliberately bail out ("Pick an
+ * answer first" etc.) when nothing's been attempted, which is right for
+ * Verify (a self-check) but wrong for Reveal (which must work with zero
+ * input). Text-only rather than reconstructing each widget's interactive
+ * state (drawing match lines, filling ordering selects, ...) — simplest
+ * thing that reliably works across every recipe.
+ */
+function revealAnswerSummary(block: PageBlock, recipe: string): string | null {
+  switch (recipe) {
+    case 'single_choice':
+    case 'multi_select': {
+      const { options, correctOptions } = c<CardChoiceContent>(block);
+      if (!correctOptions?.length) return null;
+      const answers = correctOptions.map((i) => options?.[i]).filter((s): s is string => !!s);
+      return answers.length ? `Correct answer: ${answers.join(', ')}` : null;
+    }
+    case 'matching_pairs': {
+      const { left, right, correctPairs } = c<CardMatchingContent>(block);
+      if (!correctPairs?.length) return null;
+      const pairs = correctPairs.map(([l, r]) => `${left?.[l] ?? '?'} → ${right?.[r] ?? '?'}`);
+      return `Correct pairs: ${pairs.join('; ')}`;
+    }
+    case 'ordering': {
+      const { items, correctOrder } = c<CardOrderingContent>(block);
+      if (!correctOrder?.length) return null;
+      const ordered = correctOrder.map((i) => items?.[i]).filter((s): s is string => !!s);
+      return ordered.length ? `Correct order: ${ordered.join(' → ')}` : null;
+    }
+    case 'categorize': {
+      const { items, groups, correctGroups } = c<CardCategorizeContent>(block);
+      if (!correctGroups?.length || !items?.length) return null;
+      const byGroup = new Map<string, string[]>();
+      items.forEach((item, i) => {
+        const g = groups?.[correctGroups[i]] ?? '?';
+        byGroup.set(g, [...(byGroup.get(g) ?? []), item]);
+      });
+      return `Correct grouping: ${[...byGroup.entries()].map(([g, its]) => `${g}: ${its.join(', ')}`).join(' · ')}`;
+    }
+    case 'text_input': {
+      const { answers } = c<CardTextInputContent>(block);
+      if (!answers?.length) return null;
+      return answers.length === 1 ? `Correct answer: ${answers[0]}` : `Correct answers: ${answers.join(', ')}`;
+    }
+    case 'dialogue': {
+      const { turns } = c<CardDialogueContent>(block);
+      const answers = (turns ?? []).map((t) => t.answer).filter((a): a is string => !!a);
+      return answers.length ? `Correct answer${answers.length > 1 ? 's' : ''}: ${answers.join(', ')}` : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * A plain-text rendering of the actual question/prompt for a recipe — e.g.
+ * a fill-in-blank's own template sentence (blanks shown as "____", never as
+ * real `<input>` elements), a choice card's prompt, the items to sort/order.
+ * Used for a card's back face (session.ts's hasRevealBack): the back is a
+ * plain-text summary card like any other flashcard back, not a second copy
+ * of the interactive widget, so this deliberately never returns markup —
+ * only text a `.gloss`/`.word` div can esc() and lay out safely within the
+ * card's fixed dimensions.
+ */
+function questionText(block: PageBlock, recipe: string): string {
+  switch (recipe) {
+    case 'single_choice':
+    case 'multi_select':
+      return c<CardChoiceContent>(block).prompt || '';
+    case 'matching_pairs': {
+      const { prompt, left } = c<CardMatchingContent>(block);
+      return prompt || (left?.length ? `Match: ${left.join(', ')}` : '');
+    }
+    case 'ordering': {
+      const { prompt, items } = c<CardOrderingContent>(block);
+      return prompt || (items?.length ? `Put in order: ${items.join(', ')}` : '');
+    }
+    case 'categorize': {
+      const { prompt, items, groups } = c<CardCategorizeContent>(block);
+      if (prompt) return prompt;
+      if (!items?.length) return '';
+      return `Sort: ${items.join(', ')}${groups?.length ? ` (into ${groups.join(', ')})` : ''}`;
+    }
+    case 'text_input': {
+      const { prompt, template } = c<CardTextInputContent>(block);
+      // Same blank markers renderInlineTemplate turns into real <input>s — here just flattened to plain "____" text instead.
+      if (template) return template.replace(/_{3,}|\(\s*\.\.\.\s*\)|\[\s*\]/g, '____');
+      return prompt || '';
+    }
+    case 'dialogue': {
+      const { turns } = c<CardDialogueContent>(block);
+      return (turns ?? []).map((t) => (t.speaker ? `${t.speaker}: ${t.text}` : t.text)).join('\n');
+    }
+    default:
+      return '';
+  }
+}
+
+/** Exported so Practice/Study's back-face rendering can source the question text without recomputing the recipe itself. Falls back to the block's generic instruction/title when the recipe has nothing more specific to say. */
+export function getQuestionText(block: PageBlock): string {
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  return questionText(block, recipe) || block.instruction || block.title || '';
+}
+
+/**
+ * Plain "what's the correct answer" text, independent of any attempt or DOM
+ * — same availability gate as the Verify/Reveal buttons (renderVerifyArea):
+ * only 'available' or 'inferred'. Used by Practice/Study to decide whether a
+ * generation-mode 'other' card gets a real flip-to-back-face (this text
+ * becomes the back), or falls back to the old in-place reveal when there's
+ * nothing to show.
+ */
+export function getRevealAnswerText(block: PageBlock): string | null {
+  const status: AnswerKeyStatus = block.answer_key_status ?? 'unknown';
+  if (status !== 'available' && status !== 'inferred') return null;
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  return revealAnswerSummary(block, recipe);
+}
+
+// The verify* functions above return this exact sentinel wording (never
+// null) when nothing's been attempted yet — Verify shows it as a nudge, but
+// Reveal must treat it as "nothing to judge" and fall back to a plain answer
+// summary instead of surfacing a judgment on a non-attempt.
+const NEEDS_ATTEMPT_MESSAGES = new Set([
+  'Pick an answer first.',
+  'Pick at least one answer first.',
+  'Match some pairs first.',
+  'Order every item first.',
+  'Sort every item first.',
+  'Fill in every blank first.',
+]);
+
+/**
+ * Practice's "Reveal answer" button — unlike Verify (which requires an
+ * attempt and only ever judges what's there), this always surfaces the
+ * correct answer. If the learner did attempt it, that attempt is still
+ * marked correct/incorrect in place first (same as Verify); only when
+ * there's nothing to judge does this fall back to a plain answer summary.
+ */
+export function computeRevealOutcome(block: PageBlock, container: ParentNode): VerifyOutcome | null {
+  const attempted = computeVerifyOutcome(block, container);
+  if (attempted && !NEEDS_ATTEMPT_MESSAGES.has(attempted.summary)) return attempted;
+  const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
+  const summary = revealAnswerSummary(block, recipe);
+  return summary ? { correct: true, summary, revealed: true } : attempted;
 }
 
 function wireVerifyButtons(block: PageBlock, container: ParentNode): void {

@@ -41,7 +41,15 @@ export async function signIn(email: string, password: string): Promise<void> {
 }
 
 export async function signUp(email: string, password: string): Promise<void> {
-  const { error } = await supabase.auth.signUp({ email, password });
+  // Explicit emailRedirectTo so the confirmation link lands back on whatever
+  // origin the app is actually running on, rather than relying on the
+  // dashboard's Site URL default (which is what sends users to Supabase's
+  // bare, unstyled fallback page if it's stale or wrong).
+  const { error } = await supabase.auth.signUp({
+    email,
+    password,
+    options: { emailRedirectTo: window.location.origin },
+  });
   if (error) throw error;
 }
 

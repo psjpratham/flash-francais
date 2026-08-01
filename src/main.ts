@@ -37,8 +37,8 @@ type View =
   | { name: 'stacks-list'; deckId: string; deckName: string }
   /** Study's own front door — pick which stack(s), optionally narrowed by tag, before handing off to 'study-mode'. */
   | { name: 'study-picker'; deckId: string; deckName: string }
-  /** Study mode: no scheduling, just a sequential walk through whichever stack(s) were selected on the Study picker — optionally narrowed by tag. */
-  | { name: 'study-mode'; deckId: string; deckName: string; stackIds: string[]; tagFilter: string[] };
+  /** Study mode: no scheduling, just a sequential walk through whichever stack(s) were selected on the Study picker — optionally narrowed by tag. `tileCount` is how many tiles were picked (see StudyPickerDeps.onStudySelected) — what the header should call "N stacks", not stackIds.length. */
+  | { name: 'study-mode'; deckId: string; deckName: string; stackIds: string[]; tagFilter: string[]; tileCount: number };
 let view: View = { name: 'library' };
 let wasAuthenticated = false;
 let disposeSession: (() => void) | null = null;
@@ -46,19 +46,39 @@ let disposeImportDetail: (() => void) | null = null;
 /** Purely a UI-visibility flag now (admin-only monitoring panel) — doesn't gate import capability, see 20260812000000_retire_admin_role.sql. */
 let isAdmin = false;
 
-function renderHeader(session: Session | null, due?: number, streak?: number): void {
+function renderHeader(session: Session | null, streak?: number): void {
   if (!session) {
     topRight.innerHTML = '';
     return;
   }
   topRight.innerHTML = `
     ${streak != null ? `<div class="gstat flame" title="Study streak">🔥 <span class="v">${streak}</span></div>` : ''}
-    ${due != null ? `<div class="gstat due" title="Cards due">Due <span class="v">${due}</span></div>` : ''}
-    <span class="signout" id="signOutBtn">Sign out</span>
-    <div class="avatar" title="${esc(session.user.email)}">${esc((session.user.email ?? '?')[0].toUpperCase())}</div>
+    <div class="avatar-menu">
+      <button class="avatar" id="avatarBtn" title="${esc(session.user.email)}">${esc((session.user.email ?? '?')[0].toUpperCase())}</button>
+      <div class="avatar-dropdown" id="avatarDropdown">
+        <div class="avatar-dropdown-email">${esc(session.user.email)}</div>
+        <button class="avatar-dropdown-item" id="signOutBtn">Sign out</button>
+      </div>
+    </div>
   `;
+  $(topRight, '#avatarBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    $(topRight, '#avatarDropdown').classList.toggle('open');
+  });
   $(topRight, '#signOutBtn').addEventListener('click', () => void signOut());
 }
+
+// Attached once, not per renderHeader() call (renderHeader re-renders topRight's
+// innerHTML — e.g. whenever due/streak stats load — which would otherwise stack
+// up a fresh document-level listener, each still closing over the now-detached
+// old dropdown element, on every re-render).
+document.addEventListener('click', (e) => {
+  const dropdown = topRight.querySelector('#avatarDropdown');
+  if (!dropdown || !dropdown.classList.contains('open')) return;
+  if (e.target instanceof Node && !dropdown.contains(e.target) && e.target !== topRight.querySelector('#avatarBtn')) {
+    dropdown.classList.remove('open');
+  }
+});
 
 async function startSession(session: Session, deck: DeckWithCounts): Promise<void> {
   try {
@@ -102,7 +122,7 @@ function renderView(session: Session): void {
         renderView(session);
       },
       onStudyAll: () => void startGlobalSession(session),
-      onStatsLoaded: (totalDue, streakCurrent) => renderHeader(session, totalDue, streakCurrent),
+      onStatsLoaded: (_totalDue, streakCurrent) => renderHeader(session, streakCurrent),
     });
     return;
   }
@@ -163,18 +183,19 @@ function renderView(session: Session): void {
         view = { name: 'deck', deckId };
         renderView(session);
       },
-      onStudySelected: (stackIds, tagFilter) => {
-        view = { name: 'study-mode', deckId, deckName, stackIds, tagFilter };
+      onStudySelected: (stackIds, tagFilter, tileCount) => {
+        view = { name: 'study-mode', deckId, deckName, stackIds, tagFilter, tileCount };
         renderView(session);
       },
     });
     return;
   }
   if (view.name === 'study-mode') {
-    const { deckId, deckName, stackIds, tagFilter } = view;
+    const { deckId, deckName, stackIds, tagFilter, tileCount } = view;
     void renderStudyMode(app, {
       stackIds,
       tagFilter,
+      tileCount,
       onBack: () => {
         view = { name: 'study-picker', deckId, deckName };
         renderView(session);
@@ -264,6 +285,11 @@ function route(session: Session | null): void {
   }
   if (wasAuthenticated) return; // token refresh etc. — keep whatever page is already showing
   wasAuthenticated = true;
+  if (sessionStorage.getItem('ff-auth-callback')) {
+    sessionStorage.removeItem('ff-auth-callback');
+    history.replaceState(null, '', window.location.pathname); // drop the #access_token=... fragment from the address bar
+    toast('Email confirmed — you’re all set!');
+  }
   isAdmin = false;
   getMyRole()
     .then((role) => {

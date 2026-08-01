@@ -9,7 +9,7 @@
 import { clearStudyAnswersForCards, listCardsForStacks, updateCardStudyAnswer } from '../lib/pageExtractions';
 import { getStackById } from '../lib/stacks';
 import { getRenderedPageUrl } from '../lib/pageRender';
-import { applyAnswerState, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wireAnswerCapture, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
+import { applyAnswerState, computeRevealOutcome, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wireAnswerCapture, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
 import type { CardFlashcardContent, CardWithNote } from '../types';
 import { $, confirmDialog, errMsg, esc } from '../lib/dom';
 
@@ -25,11 +25,20 @@ export interface StudyModeDeps {
   stackIds: string[];
   /** Narrows cards within the selected stack(s) — Study's equivalent of the old deck-wide Practice tag filter, scoped to the selection instead. */
   tagFilter: string[];
+  /** How many tiles the learner actually picked on the Study picker — the header's "N stacks" must echo this, not stackIds.length. A single import tile picked there can expand to many underlying per-page `stacks` rows (one per page), so stackIds.length routinely runs way ahead of what was actually clicked — see StudyPickerDeps.onStudySelected. */
+  tileCount: number;
+}
+
+/** One entry per selected stack that actually contributed a card (a tag filter can empty one out entirely) — `cards` is already sorted stack-by-stack (see listCardsForStacks), so each group is a contiguous run starting at `startIndex`. Powers the page-nav strip, same idea as pageReview.ts's own Prev/Next-page-of-this-import bar, just one level up: jumping between stacks instead of between pages within one. */
+interface StudyPageGroup {
+  name: string;
+  startIndex: number;
 }
 
 export async function renderStudyMode(container: HTMLElement, deps: StudyModeDeps): Promise<void> {
   let cards: CardWithNote[] = [];
   let title = '';
+  let pageGroups: StudyPageGroup[] = [];
   // Per-card source image, not one shared image — a multi-stack study walk can cross several different source pages, each with its own image.
   const pageImageUrls = new Map<string, string>();
   let pos = 0;
@@ -78,8 +87,12 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
         Promise.all(deps.stackIds.map((id) => getStackById(id))),
         listCardsForStacks(deps.stackIds, deps.tagFilter),
       ]);
-      title = stackInfos.length === 1 ? stackInfos[0].name : `${stackInfos.length} stacks`;
+      title = stackInfos.length === 1 ? stackInfos[0].name : `${deps.tileCount} stack${deps.tileCount === 1 ? '' : 's'}`;
       cards = stackCards;
+      const nameByStackId = new Map(stackInfos.map((s) => [s.id, s.name]));
+      pageGroups = deps.stackIds
+        .map((id) => ({ name: nameByStackId.get(id) ?? '—', startIndex: cards.findIndex((c) => c.stack_id === id) }))
+        .filter((g) => g.startIndex !== -1);
 
       const cardsWithSavedAnswers = cards.filter((c) => c.study_answer != null);
       if (cardsWithSavedAnswers.length && (await confirmDialog('You have saved answers from a previous Study session. Clear them before studying?'))) {
@@ -107,7 +120,7 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
   function shell(inner: string): void {
     container.innerHTML = `
       <div class="wrap">
-        <button class="back-link" id="backBtn">← ${esc(title || 'Back')}</button>
+        <button class="back-link" id="backBtn">← Stacks</button>
         ${inner}
       </div>`;
     $(container, '#backBtn').addEventListener('click', () => {
@@ -129,16 +142,64 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
         <span class="sess-pill"><span class="n">${pos + 1} / ${total}</span><span>${esc(title)}</span></span>
       </div>
       <div class="sessbar"><span style="width:${Math.round((pos / total) * 100)}%"></span></div>
+      ${renderPageNav()}
+      <div class="row" style="justify-content:center;margin-bottom:14px" id="studyControlsTop"></div>
       <div id="studyCardArea">${cardHTML(card)}</div>
       <div class="row" style="justify-content:center;margin-top:16px" id="studyControls"></div>
     `);
     wireCard(card);
     renderControls();
+    wirePageNav();
+  }
+
+  /** Which selected stack `pos` currently sits inside — pageGroups is ordered and each group's cards are contiguous, so the last group whose startIndex is at-or-before pos is the current one. */
+  function currentPageIndex(): number {
+    let idx = 0;
+    for (let i = pageGroups.length - 1; i >= 0; i--) {
+      if (pos >= pageGroups[i].startIndex) {
+        idx = i;
+        break;
+      }
+    }
+    return idx;
+  }
+
+  function goToPage(i: number): void {
+    if (i < 0 || i >= pageGroups.length) return;
+    flushAllAnswerSaves();
+    pos = pageGroups[i].startIndex;
+    flipped = false;
+    render();
+  }
+
+  /** Prev/Next + jump strip across the selected stacks — same layout/classes as pageReview.ts's own page-nav, one level up: jumping between whole stacks instead of between pages within one. Omitted for a single-stack study walk, where there's nothing to navigate. */
+  function renderPageNav(): string {
+    if (pageGroups.length <= 1) return '';
+    const idx = currentPageIndex();
+    return `
+      <div class="page-nav">
+        <button class="btn-sec" id="prevPageBtn" ${idx === 0 ? 'disabled' : ''}>← Prev page</button>
+        <div class="page-nav-strip">
+          <span class="page-nav-label">Page ${idx + 1} of ${pageGroups.length}</span>
+          <div class="page-nav-dots">${pageGroups.map((g, i) => `<button class="page-thumb ${i === idx ? 'on' : ''}" data-goto-page="${i}" title="${esc(g.name)}">${i + 1}</button>`).join('')}</div>
+        </div>
+        <button class="btn-sec" id="nextPageBtn" ${idx === pageGroups.length - 1 ? 'disabled' : ''}>Next page →</button>
+      </div>`;
+  }
+
+  function wirePageNav(): void {
+    if (pageGroups.length <= 1) return;
+    const idx = currentPageIndex();
+    document.getElementById('prevPageBtn')?.addEventListener('click', () => goToPage(idx - 1));
+    document.getElementById('nextPageBtn')?.addEventListener('click', () => goToPage(idx + 1));
+    document.querySelectorAll<HTMLButtonElement>('[data-goto-page]').forEach((btn) => {
+      btn.addEventListener('click', () => goToPage(Number(btn.dataset.gotoPage)));
+    });
   }
 
   /** Page-stack cards render read-only (nothing to guess, so nothing to flip) in the same split page-image view the review UI and practice session both use — studying one reads exactly like reviewing it. The source pane only shows when this card's own "show source in study mode" toggle is on — independent of its Practice-mode counterpart. */
   function importedFace(card: CardWithNote): string {
-    const content = `<div class="session-imported-left" data-read-block-id="${esc(card.id)}">${renderReadModeBlock(card, new Map(), true)}</div>`;
+    const content = `<div class="session-imported-left" data-read-block-id="${esc(card.id)}">${renderReadModeBlock(card, new Map(), true, true)}</div>`;
     const imagePath = card.import_pages?.rendered_page_path ?? null;
     const imageUrl = card.show_source_in_study && imagePath ? pageImageUrls.get(imagePath) : null;
     if (!imageUrl) {
@@ -203,6 +264,19 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
     return card.origin === 'textbook_extraction' ? importedFace(card) : manualFace(card);
   }
 
+  /** Reveal is a plain self-check here — Study mode has no grading to gate, so it never disables/swaps controls like Practice's revealGeneratedOther does; it just shows the answer in the same feedback area Verify uses. */
+  function wireRevealButton(card: CardWithNote, el: HTMLElement): void {
+    el.querySelector<HTMLButtonElement>('[data-reveal-block]')?.addEventListener('click', () => {
+      const outcome = computeRevealOutcome(card, el);
+      const area = el.querySelector<HTMLElement>('[data-feedback-area]');
+      if (!area || !outcome) return;
+      area.hidden = false;
+      area.classList.remove('correct', 'incorrect', 'revealed');
+      area.classList.add(outcome.revealed ? 'revealed' : outcome.correct ? 'correct' : 'incorrect');
+      area.textContent = outcome.revealed ? outcome.summary : (outcome.correct ? '✓ ' : '✗ ') + outcome.summary;
+    });
+  }
+
   function wireCard(card: CardWithNote): void {
     if (isFlashcardCard(card)) {
       const el = document.getElementById('studyFlashcard');
@@ -222,6 +296,7 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
         wireReadModeBlock(card, el);
         applyAnswerState(card, el, card.study_answer);
         wireAnswerCapture(card, el, (state) => scheduleAnswerSave(card.id, state));
+        wireRevealButton(card, el);
       }
       return;
     }
@@ -231,23 +306,31 @@ export async function renderStudyMode(container: HTMLElement, deps: StudyModeDep
     });
   }
 
+  function goPrev(): void {
+    flushAllAnswerSaves();
+    pos = Math.max(0, pos - 1);
+    flipped = false;
+    render();
+  }
+
+  function goNext(): void {
+    flushAllAnswerSaves();
+    pos += 1;
+    flipped = false;
+    render();
+  }
+
+  /** Prev/Next appear both above and below the card — a long imported card's controls can otherwise scroll out of view, so the top pair is a duplicate for reachability without scrolling back up. */
   function renderControls(): void {
-    const el = document.getElementById('studyControls');
-    if (!el) return;
-    el.innerHTML = `
-      <button class="btn-sec" id="prevBtn" ${pos === 0 ? 'disabled' : ''}>← Prev</button>
-      <button class="btn-primary" style="width:auto" id="nextBtn">${pos === cards.length - 1 ? 'Finish' : 'Next →'}</button>`;
-    $(el, '#prevBtn').addEventListener('click', () => {
-      flushAllAnswerSaves();
-      pos = Math.max(0, pos - 1);
-      flipped = false;
-      render();
-    });
-    $(el, '#nextBtn').addEventListener('click', () => {
-      flushAllAnswerSaves();
-      pos += 1;
-      flipped = false;
-      render();
+    const controlsHTML = `
+      <button class="btn-sec" data-study-prev ${pos === 0 ? 'disabled' : ''}>← Prev</button>
+      <button class="btn-primary" style="width:auto" data-study-next>${pos === cards.length - 1 ? 'Finish' : 'Next →'}</button>`;
+    ['studyControlsTop', 'studyControls'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.innerHTML = controlsHTML;
+      el.querySelector('[data-study-prev]')?.addEventListener('click', goPrev);
+      el.querySelector('[data-study-next]')?.addEventListener('click', goNext);
     });
   }
 

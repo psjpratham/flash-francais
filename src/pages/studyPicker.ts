@@ -19,7 +19,8 @@ export interface StudyPickerDeps {
   onBack: () => void;
   deckId: string;
   deckName: string;
-  onStudySelected: (stackIds: string[], tagFilter: string[]) => void;
+  /** `tileCount` is how many tiles the learner actually picked here — Study mode's header should echo that number back (see studyMode.ts's title), not the raw count of underlying per-page `stacks` rows those tiles expand to (stackIds.length), which can run well ahead of what was actually clicked. */
+  onStudySelected: (stackIds: string[], tagFilter: string[], tileCount: number) => void;
 }
 
 export async function renderStudyPicker(container: HTMLElement, deps: StudyPickerDeps): Promise<void> {
@@ -134,7 +135,7 @@ export async function renderStudyPicker(container: HTMLElement, deps: StudyPicke
     });
     document.getElementById('studySelectedBtn')?.addEventListener('click', () => {
       const stackIds = (tiles ?? []).filter((t) => selectedTileIds.has(t.id)).flatMap((t) => t.stackIds);
-      deps.onStudySelected(stackIds, tagFilter);
+      deps.onStudySelected(stackIds, tagFilter, selectedTileIds.size);
     });
   }
 
