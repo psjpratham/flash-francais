@@ -44,11 +44,14 @@ export async function signUp(email: string, password: string): Promise<void> {
   // Explicit emailRedirectTo so the confirmation link lands back on whatever
   // origin the app is actually running on, rather than relying on the
   // dashboard's Site URL default (which is what sends users to Supabase's
-  // bare, unstyled fallback page if it's stale or wrong).
+  // bare, unstyled fallback page if it's stale or wrong). Must include Vite's
+  // BASE_URL (e.g. '/flash-francais/') — on GitHub Pages project sites,
+  // location.origin alone points at the bare github.io root, which has no
+  // site published there and 404s.
   const { error } = await supabase.auth.signUp({
     email,
     password,
-    options: { emailRedirectTo: window.location.origin },
+    options: { emailRedirectTo: window.location.origin + import.meta.env.BASE_URL },
   });
   if (error) throw error;
 }
@@ -60,7 +63,9 @@ export async function signOut(): Promise<void> {
 
 /** Sends a password-reset email; clicking the link lands back on this origin with a recovery session (see index.html's `type=recovery` hash detection and main.ts's pendingPasswordRecovery handling). */
 export async function resetPasswordForEmail(email: string): Promise<void> {
-  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin + import.meta.env.BASE_URL,
+  });
   if (error) throw error;
 }
 
