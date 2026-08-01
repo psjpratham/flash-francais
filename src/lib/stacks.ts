@@ -146,7 +146,16 @@ export async function listStackTilesForDeck(deckId: string): Promise<StackTile[]
     byImport.set(s.importId, group);
   }
 
-  const importTiles: StackTile[] = [...byImport.entries()].map(([importId, group]) => {
+  const importTiles: StackTile[] = [...byImport.entries()].map(([importId, unsortedGroup]) => {
+    // Extraction processes several pages CONCURRENTLY (see
+    // processExtractionJobsBatch in extractWorker.ts), so each page's stacks
+    // row lands at whatever created_at its own extraction call happened to
+    // finish at — not the order the pages actually appear in the source.
+    // stackIds below is exactly what Study mode walks through (Prev/Next),
+    // so it has to be sorted by the pages' real reading order (pageIndex),
+    // never trusted to already be in that order just because the DB query
+    // itself was ordered by created_at.
+    const group = [...unsortedGroup].sort((a, b) => (a.pageIndex ?? 0) - (b.pageIndex ?? 0));
     // A kind='custom' stack's own `status` (an image import's shared merged
     // stack) is set once at creation and never updated afterward by the
     // extraction pipeline — only a kind='page' stack's status is ever
