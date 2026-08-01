@@ -712,8 +712,24 @@ export interface VerifyOutcome {
   revealed?: boolean;
 }
 
+/**
+ * Strips a trailing full stop and folds apostrophe variants before
+ * comparing. Trailing `.` is dropped because a text-input answer's meaning
+ * is never carried by whether the learner typed the closing period — but
+ * `!`/`?` are kept significant (they change what the sentence *is*, not
+ * just how it ends). Apostrophes are folded to a plain `'` because
+ * "C'est" (typed) vs "C’est" (a curly apostrophe baked into the answer
+ * key) are the same word — the learner has no reasonable way to type the
+ * curly variant on a normal keyboard. All other punctuation, including
+ * mid-sentence, is left exactly as typed.
+ */
 function normalizeAnswer(s: string): string {
-  return s.trim().toLowerCase().replace(/\s+/g, ' ');
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[’‘‛‚`´]/g, "'")
+    .replace(/\.+$/, '');
 }
 
 function markVerify(el: Element | null, correct: boolean): void {
@@ -1265,14 +1281,22 @@ const NEEDS_ATTEMPT_MESSAGES = new Set([
  * Practice's "Reveal answer" button — unlike Verify (which requires an
  * attempt and only ever judges what's there), this always surfaces the
  * correct answer. If the learner did attempt it, that attempt is still
- * marked correct/incorrect in place first (same as Verify); only when
- * there's nothing to judge does this fall back to a plain answer summary.
+ * marked correct/incorrect in place first (same as Verify) — but a wrong
+ * attempt's summary ("Not quite — incorrect answers are highlighted.")
+ * never contained the actual answer text, so Reveal appends it: the
+ * highlighting alone tells you *that* you're wrong, never *what* was right
+ * (especially for text_input, where there's nothing else on screen to
+ * infer it from). A correct attempt needs no addition — "Correct!" already
+ * says everything Reveal would.
  */
 export function computeRevealOutcome(block: PageBlock, container: ParentNode): VerifyOutcome | null {
   const attempted = computeVerifyOutcome(block, container);
-  if (attempted && !NEEDS_ATTEMPT_MESSAGES.has(attempted.summary)) return attempted;
   const recipe = resolveReadModeComponentType(block.block_kind ?? 'document', block.component_type ?? '', (block.content ?? {}) as Record<string, unknown>);
   const summary = revealAnswerSummary(block, recipe);
+  if (attempted && !NEEDS_ATTEMPT_MESSAGES.has(attempted.summary)) {
+    if (attempted.correct || !summary) return attempted;
+    return { correct: false, summary: `${attempted.summary} ${summary}`, revealed: false };
+  }
   return summary ? { correct: true, summary, revealed: true } : attempted;
 }
 
