@@ -4,6 +4,8 @@ import { getMyRole, getSession, onAuthChange, signOut } from './lib/auth';
 import { loadQueueAcrossAllDecks, loadQueueForDeck } from './lib/cards';
 import { listDecksWithCounts } from './lib/decks';
 import { renderAuth } from './pages/auth';
+import { renderResetPassword } from './pages/resetPassword';
+import { renderSettings } from './pages/settings';
 import { renderLibrary } from './pages/library';
 import { renderDeckDetail } from './pages/deck';
 import { renderSession } from './pages/session';
@@ -38,9 +40,12 @@ type View =
   /** Study's own front door — pick which stack(s), optionally narrowed by tag, before handing off to 'study-mode'. */
   | { name: 'study-picker'; deckId: string; deckName: string }
   /** Study mode: no scheduling, just a sequential walk through whichever stack(s) were selected on the Study picker — optionally narrowed by tag. `tileCount` is how many tiles were picked (see StudyPickerDeps.onStudySelected) — what the header should call "N stacks", not stackIds.length. */
-  | { name: 'study-mode'; deckId: string; deckName: string; stackIds: string[]; tagFilter: string[]; tileCount: number };
+  | { name: 'study-mode'; deckId: string; deckName: string; stackIds: string[]; tagFilter: string[]; tileCount: number }
+  | { name: 'settings' };
 let view: View = { name: 'library' };
 let wasAuthenticated = false;
+/** Set when the app was reached via a password-reset email link (see index.html's `type=recovery` detection) — overrides normal routing until a new password is saved. */
+let pendingPasswordRecovery = false;
 let disposeSession: (() => void) | null = null;
 let disposeImportDetail: (() => void) | null = null;
 /** Purely a UI-visibility flag now (admin-only monitoring panel) — doesn't gate import capability, see 20260812000000_retire_admin_role.sql. */
@@ -57,13 +62,19 @@ function renderHeader(session: Session | null, streak?: number): void {
       <button class="avatar" id="avatarBtn" title="${esc(session.user.email)}">${esc((session.user.email ?? '?')[0].toUpperCase())}</button>
       <div class="avatar-dropdown" id="avatarDropdown">
         <div class="avatar-dropdown-email">${esc(session.user.email)}</div>
-        <button class="avatar-dropdown-item" id="signOutBtn">Sign out</button>
+        <button class="avatar-dropdown-item" id="settingsBtn">Settings</button>
+        <button class="avatar-dropdown-item danger" id="signOutBtn">Sign out</button>
       </div>
     </div>
   `;
   $(topRight, '#avatarBtn').addEventListener('click', (e) => {
     e.stopPropagation();
     $(topRight, '#avatarDropdown').classList.toggle('open');
+  });
+  $(topRight, '#settingsBtn').addEventListener('click', () => {
+    $(topRight, '#avatarDropdown').classList.remove('open');
+    view = { name: 'settings' };
+    renderView(session);
   });
   $(topRight, '#signOutBtn').addEventListener('click', () => void signOut());
 }
@@ -251,6 +262,17 @@ function renderView(session: Session): void {
     });
     return;
   }
+  if (view.name === 'settings') {
+    renderSettings(app, {
+      currentUserEmail: session.user.email ?? '',
+      onBack: () => {
+        view = { name: 'library' };
+        renderView(session);
+      },
+      onAccountDeleted: () => void signOut(),
+    });
+    return;
+  }
   const importDeckId = view.deckId;
   const importDeckName = view.deckName;
   renderImportContent(app, {
@@ -280,6 +302,25 @@ function route(session: Session | null): void {
     disposeSession = null;
     renderAuth(app, () => {
       /* onAuthChange below picks up the new session and re-routes */
+    });
+    return;
+  }
+  if (sessionStorage.getItem('ff-recovery-callback')) {
+    sessionStorage.removeItem('ff-recovery-callback');
+    history.replaceState(null, '', window.location.pathname); // drop the #access_token=... fragment from the address bar
+    pendingPasswordRecovery = true;
+  }
+  if (pendingPasswordRecovery) {
+    disposeSession?.();
+    disposeSession = null;
+    renderResetPassword(app, {
+      onDone: () => {
+        pendingPasswordRecovery = false;
+        wasAuthenticated = true;
+        toast('Password updated — you’re all set!');
+        view = { name: 'library' };
+        renderView(session);
+      },
     });
     return;
   }

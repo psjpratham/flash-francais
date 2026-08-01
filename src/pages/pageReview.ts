@@ -19,7 +19,7 @@ import {
 } from '../lib/pageExtractions';
 import { getRenderedPageUrl, renderPendingPageImages } from '../lib/pageRender';
 import { componentTypeLabel } from '../lib/blockRenderers';
-import { renderReadModeBlock, wireReadModeBlock } from '../lib/readModeRenderers';
+import { computeRevealOutcome, renderReadModeBlock, wireReadModeBlock } from '../lib/readModeRenderers';
 import { formatNumberedSourceLines } from '../lib/sourceLines';
 import { parseContentFields, renderContentFieldsHTML } from '../lib/cardEditorFields';
 
@@ -579,7 +579,7 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
       ${
         isFlashcardPreviewable && practicePreviewOn
           ? renderFlashcardPracticePreview(block)
-          : `<div class="page-read-content" data-read-block-id="${esc(block.id)}">${renderReadModeBlock(block, byId, true)}</div>`
+          : `<div class="page-read-content" data-read-block-id="${esc(block.id)}">${renderReadModeBlock(block, byId, true, true)}</div>`
       }
       <div class="card-options-panel">
         <h4>Card options</h4>
@@ -666,7 +666,7 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
             <button class="btn-icon" data-delete="${esc(block.id)}" title="Delete">🗑</button>
           </div>
         </div>
-        <div class="page-read-content" data-read-block-id="${esc(block.id)}">${renderReadModeBlock(block, byId, false)}</div>
+        <div class="page-read-content" data-read-block-id="${esc(block.id)}">${renderReadModeBlock(block, byId, false, true)}</div>
         ${audioControl}
         ${block.source_line_ids?.length ? `<div class="book-src">lines: ${block.source_line_ids.join(', ')}</div>` : ''}
       </div>`;
@@ -895,10 +895,26 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     // the same way, regardless of which pane is currently active.
     document.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => {
       const block = blocks.find((b) => b.id === el.dataset.readBlockId);
-      if (block) wireReadModeBlock(block, el);
+      if (block) {
+        wireReadModeBlock(block, el);
+        wireRevealButton(block, el);
+      }
     });
 
     if (viewMode === 'rearrange') wireDragAndDrop();
+  }
+
+  /** Same self-check reveal as Study mode: no grading to gate here either, it just shows the answer in the same feedback area Verify uses. */
+  function wireRevealButton(block: PageBlock, el: HTMLElement): void {
+    el.querySelector<HTMLButtonElement>('[data-reveal-block]')?.addEventListener('click', () => {
+      const outcome = computeRevealOutcome(block, el);
+      const area = el.querySelector<HTMLElement>('[data-feedback-area]');
+      if (!area || !outcome) return;
+      area.hidden = false;
+      area.classList.remove('correct', 'incorrect', 'revealed');
+      area.classList.add(outcome.revealed ? 'revealed' : outcome.correct ? 'correct' : 'incorrect');
+      area.textContent = outcome.revealed ? outcome.summary : (outcome.correct ? '✓ ' : '✗ ') + outcome.summary;
+    });
   }
 
   function wireDragAndDrop(): void {

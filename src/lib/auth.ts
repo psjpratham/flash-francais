@@ -58,6 +58,57 @@ export async function signOut(): Promise<void> {
   if (error) throw error;
 }
 
+/** Sends a password-reset email; clicking the link lands back on this origin with a recovery session (see index.html's `type=recovery` hash detection and main.ts's pendingPasswordRecovery handling). */
+export async function resetPasswordForEmail(email: string): Promise<void> {
+  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+  if (error) throw error;
+}
+
+/** Sets a new password for the current session — used both from the settings page (already signed in) and from the post-recovery-link flow (a recovery session counts as signed in too). */
+export async function updatePassword(newPassword: string): Promise<void> {
+  const { error } = await supabase.auth.updateUser({ password: newPassword });
+  if (error) throw error;
+}
+
+/**
+ * Permanently deletes the current user's account: their auth.users row and,
+ * via ON DELETE CASCADE, every owned DB row (profile, decks, cards, notes,
+ * imports, jobs, review_log — see 20260724220036_remote_schema.sql). Storage
+ * objects aren't part of that FK graph, so the edge function cleans those up
+ * first, same reasoning as deleteDeckDeep in lib/decks.ts.
+ *
+ * Goes through an edge function (see supabase/functions/delete-account), not
+ * a plain RPC, because deleting an auth.users row requires the service-role
+ * key (supabase.auth.admin.deleteUser) — never something a client-side RPC
+ * can hold.
+ */
+export async function deleteMyAccount(): Promise<void> {
+  const { data, error } = await supabase.functions.invoke<{ ok: boolean; error?: string }>('delete-account');
+  if (error) throw new Error(await functionErrorMessage(error));
+  if (!data?.ok) throw new Error(data?.error ?? 'Could not delete your account.');
+}
+
+/**
+ * supabase.functions.invoke's error on a non-2xx response is always the
+ * generic "Edge Function returned a non-2xx status code" — the function's
+ * own `{ ok: false, error: "..." }` JSON body, which has the actual reason,
+ * is left on `error.context` (the raw Response) and never surfaced
+ * automatically. Read it so a failure shows the real cause. Same pattern as
+ * cloneErrorMessage in lib/decks.ts.
+ */
+async function functionErrorMessage(error: { message: string; context?: unknown }): Promise<string> {
+  const context = error.context;
+  if (context instanceof Response) {
+    try {
+      const body = (await context.clone().json()) as { error?: string };
+      if (body?.error) return body.error;
+    } catch {
+      /* body wasn't JSON (e.g. a platform-level 546/504) — fall through to the generic message */
+    }
+  }
+  return error.message;
+}
+
 /** Fires on sign-in, sign-out, and token refresh. Returns an unsubscribe function. */
 export function onAuthChange(cb: (session: Session | null) => void): () => void {
   const {

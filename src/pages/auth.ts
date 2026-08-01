@@ -1,15 +1,19 @@
-import { signIn, signUp, getSession } from '../lib/auth';
+import { signIn, signUp, getSession, resetPasswordForEmail } from '../lib/auth';
 import { $, errMsg, esc } from '../lib/dom';
 
-type Mode = 'signin' | 'signup';
+type Mode = 'signin' | 'signup' | 'forgot';
 
-/** Renders the sign-in/sign-up card into `container` and calls `onAuthenticated` once a session exists. */
+/** Renders the sign-in/sign-up/forgot-password card into `container` and calls `onAuthenticated` once a session exists. */
 export function renderAuth(container: HTMLElement, onAuthenticated: () => void): void {
   let mode: Mode = 'signin';
   let error: string | null = null;
   let info: string | null = null;
 
   function render(): void {
+    if (mode === 'forgot') {
+      renderForgot();
+      return;
+    }
     container.innerHTML = `
       <div class="auth-wrap">
         <div class="auth-card">
@@ -28,6 +32,7 @@ export function renderAuth(container: HTMLElement, onAuthenticated: () => void):
             </div>
             <button class="btn-primary" id="authBtn" type="submit">${mode === 'signin' ? 'Sign in' : 'Sign up'}</button>
           </form>
+          ${mode === 'signin' ? `<div class="auth-toggle"><b id="forgotToggle">Forgot password?</b></div>` : ''}
           <div class="auth-toggle">
             ${
               mode === 'signin'
@@ -45,10 +50,69 @@ export function renderAuth(container: HTMLElement, onAuthenticated: () => void):
       render();
     });
 
+    document.getElementById('forgotToggle')?.addEventListener('click', () => {
+      mode = 'forgot';
+      error = null;
+      info = null;
+      render();
+    });
+
     $(container, '#authForm').addEventListener('submit', (e) => {
       e.preventDefault();
       void submit();
     });
+  }
+
+  function renderForgot(): void {
+    container.innerHTML = `
+      <div class="auth-wrap">
+        <div class="auth-card">
+          <h1>Reset your password</h1>
+          <p>Enter your email and we'll send you a link to reset your password.</p>
+          ${error ? `<div class="auth-err">${esc(error)}</div>` : ''}
+          ${info ? `<div class="auth-ok">${esc(info)}</div>` : ''}
+          <form id="forgotForm">
+            <div class="field">
+              <label for="forgotEmail">Email</label>
+              <input id="forgotEmail" type="email" autocomplete="email" required>
+            </div>
+            <button class="btn-primary" id="forgotBtn" type="submit">Send reset link</button>
+          </form>
+          <div class="auth-toggle"><b id="backToSignIn">Back to sign in</b></div>
+        </div>
+      </div>`;
+
+    $(container, '#backToSignIn').addEventListener('click', () => {
+      mode = 'signin';
+      error = null;
+      info = null;
+      render();
+    });
+
+    $(container, '#forgotForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      void submitForgot();
+    });
+  }
+
+  async function submitForgot(): Promise<void> {
+    const email = $<HTMLInputElement>(container, '#forgotEmail').value.trim();
+    error = null;
+    info = null;
+
+    const btn = $<HTMLButtonElement>(container, '#forgotBtn');
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span>`;
+
+    try {
+      await resetPasswordForEmail(email);
+      mode = 'signin';
+      info = 'Check your email for a link to reset your password.';
+      render();
+    } catch (e) {
+      error = errMsg(e);
+      render();
+    }
   }
 
   async function submit(): Promise<void> {

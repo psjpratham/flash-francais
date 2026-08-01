@@ -38,8 +38,11 @@
           if (/type=signup/.test(window.location.hash)) {
             sessionStorage.setItem('ff-auth-callback', '1');
           }
+          if (/type=recovery/.test(window.location.hash)) {
+            sessionStorage.setItem('ff-recovery-callback', '1');
+          }
         } catch (e) {
-          /* sessionStorage unavailable — worst case, the confirmation toast is skipped */
+          /* sessionStorage unavailable — worst case, the confirmation toast/reset-password prompt is skipped */
         }
       })();
     </script>
