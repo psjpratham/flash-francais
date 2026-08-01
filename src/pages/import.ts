@@ -241,7 +241,7 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
                    <p>The more specific you are, the better the cards — a vague prompt like "make flashcards" leaves a lot to guesswork. Consider mentioning:</p>
                    <ul>
                      <li><strong>Roughly how many cards</strong> you want (e.g. "about 15 cards" or "one per vocabulary word")</li>
-                     <li><strong>What kind of cards</strong> — plain flashcards, fill-in-the-blank, matching pairs, multiple choice, etc.</li>
+                     <li><strong>What kind of cards</strong> — plain recall flashcards (a term you flip to reveal the answer), activity-based cards (fill-in-the-blank, matching pairs, multiple choice, etc.), or a mix of both are all possible. If you don't say, recall-style content (vocabulary, grammar points) defaults to flashcards — mention it explicitly if you want activities instead, or alongside them</li>
                      <li><strong>What each card should include</strong> — an example sentence, IPA/pronunciation, a usage tip, a grammar note</li>
                      <li><strong>The learners' level</strong> — A1, A2, B1, B2… so wording and vocabulary actually match</li>
                      <li><strong>Whether you want a grammar table or rule</strong> laid out explicitly, or just examples in context</li>
