@@ -230,13 +230,24 @@ export function renderImportContent(container: HTMLElement, deps: ImportContentD
 
           ${
             extractionMode === 'faithful'
-              ? `<div class="infocard composer-faithful-info">
+              ? `<div class="composer-info">
                    <strong>What "faithful extraction" means</strong>
                    <p>Use this when your source <em>is</em> the material you want cards from — a textbook page, a worksheet, a set of activities — and you want the cards to mirror it exactly, not be reshaped or summarized by a prompt.</p>
                    <p>Each exercise on the page becomes its own card, reproducing the original wording as written. Cards only get a real front/back/checkable answer if that exercise's answer is present — either printed on the page itself, or supplied separately as an attached answer key ("corrigé", optional above). Otherwise the card is read-only: it shows the exercise but has no answer to check against.</p>
                    <p>If you'd rather describe how the cards should be shaped (e.g. "make vocabulary flashcards from this"), switch to <strong>Generate with a prompt</strong> instead.</p>
                  </div>`
-              : ''
+              : `<div class="composer-info">
+                   <strong>Writing a good prompt</strong>
+                   <p>The more specific you are, the better the cards — a vague prompt like "make flashcards" leaves a lot to guesswork. Consider mentioning:</p>
+                   <ul>
+                     <li><strong>Roughly how many cards</strong> you want (e.g. "about 15 cards" or "one per vocabulary word")</li>
+                     <li><strong>What kind of cards</strong> — plain flashcards, fill-in-the-blank, matching pairs, multiple choice, etc.</li>
+                     <li><strong>What each card should include</strong> — an example sentence, IPA/pronunciation, a usage tip, a grammar note</li>
+                     <li><strong>The learners' level</strong> — A1, A2, B1, B2… so wording and vocabulary actually match</li>
+                     <li><strong>Whether you want a grammar table or rule</strong> laid out explicitly, or just examples in context</li>
+                     <li><strong>Which direction to test recall in</strong> — shown French and recall the translation, or the reverse. If you don't say, it defaults to showing the translation and testing recall of the French.</li>
+                   </ul>
+                 </div>`
           }
 
           ${
