@@ -17,7 +17,7 @@ import { renderStudyPicker } from './pages/studyPicker';
 import { renderStudyMode } from './pages/studyMode';
 import { initAccentKeyboard } from './lib/accentKeyboard';
 import { initTheme } from './lib/theme';
-import { $, errMsg, esc, toast } from './lib/dom';
+import { $, errMsg, esc, pinToast, toast } from './lib/dom';
 import type { CardWithNote, Deck, DeckWithCounts } from './types';
 
 const app = $(document, '#app');
@@ -331,6 +331,8 @@ function route(session: Session | null): void {
     history.replaceState(null, '', window.location.pathname); // drop the #access_token=... fragment from the address bar
     toast('Email confirmed — you’re all set!');
   }
+  const themeSwitch = document.querySelector<HTMLElement>('.theme-switch');
+  if (themeSwitch) pinToast(themeSwitch, 'Try the dark / light mode', 3000);
   isAdmin = false;
   getMyRole()
     .then((role) => {

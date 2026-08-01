@@ -104,11 +104,51 @@ export function promptDialog(title: string, defaultValue = '', confirmLabel = 'S
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
-export function toast(message: string): void {
+export function toast(message: string, durationMs = 1800): void {
   const el = document.getElementById('toast');
   if (!el) return;
   el.textContent = message;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+  toastTimer = setTimeout(() => el.classList.remove('show'), durationMs);
+}
+
+let pinToastEl: HTMLElement | null = null;
+let pinToastTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * A callout bubble pinned to `target` with an arrow pointing at it — unlike
+ * `toast()`'s generic bottom-of-screen pill, this is for nudging the learner
+ * toward one specific control (e.g. "click to flip" pointing at the Reveal
+ * button). Flips above/below depending on which side has room; re-measures
+ * fresh every call rather than tracking scroll/resize, since it's only ever
+ * on screen for a few seconds.
+ */
+export function pinToast(target: HTMLElement, message: string, durationMs = 3000): void {
+  pinToastEl?.remove();
+  clearTimeout(pinToastTimer);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'pin-toast';
+  bubble.textContent = message;
+  document.body.appendChild(bubble);
+  pinToastEl = bubble;
+
+  const rect = target.getBoundingClientRect();
+  const bubbleRect = bubble.getBoundingClientRect();
+  const below = window.innerHeight - rect.bottom >= bubbleRect.height + 16 || rect.top < bubbleRect.height + 16;
+  bubble.classList.add(below ? 'pin-toast-below' : 'pin-toast-above');
+
+  const left = Math.min(Math.max(rect.left + rect.width / 2 - bubbleRect.width / 2, 8), window.innerWidth - bubbleRect.width - 8);
+  const top = below ? rect.bottom + 10 : rect.top - bubbleRect.height - 10;
+  bubble.style.left = `${left}px`;
+  bubble.style.top = `${top}px`;
+  const arrowLeft = Math.min(Math.max(rect.left + rect.width / 2 - left, 14), bubbleRect.width - 14);
+  bubble.style.setProperty('--pin-arrow-left', `${arrowLeft}px`);
+
+  requestAnimationFrame(() => bubble.classList.add('show'));
+  pinToastTimer = setTimeout(() => {
+    bubble.classList.remove('show');
+    setTimeout(() => bubble.remove(), 200);
+  }, durationMs);
 }

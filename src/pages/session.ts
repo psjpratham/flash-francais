@@ -3,7 +3,7 @@ import { fetchDeckStats } from '../lib/decks';
 import { previewAll } from '../lib/fsrs';
 import { playCardAudio } from '../lib/audioPlayer';
 import type { CardFlashcardContent, CardWithNote, Deck, DeckStatsWithStreak, NoteFields, Rating } from '../types';
-import { $, esc, errMsg, toast } from '../lib/dom';
+import { $, esc, errMsg, pinToast, toast } from '../lib/dom';
 import { barRow } from './statsPanel';
 import { PROFILES, type ChipAs, type ProfileChip } from '../lib/profiles';
 import { computeRevealOutcome, getQuestionText, getRevealAnswerText, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
@@ -356,7 +356,21 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     // this only ever runs once, pre-flip.
     if (isGeneratedOther) {
       container.querySelectorAll<HTMLElement>('[data-read-block-id]').forEach((el) => wireReadModeBlock(card, el));
-      container.querySelector<HTMLButtonElement>('[data-reveal-block]')?.addEventListener('click', flip);
+      const revealBtn = container.querySelector<HTMLButtonElement>('[data-reveal-block]');
+      revealBtn?.addEventListener('click', flip);
+      // If the learner checks their own attempt via Verify instead of just
+      // hitting Reveal, and it comes back correct, nudge them toward the
+      // still-unused Reveal button (added *after* wireReadModeBlock's own
+      // verify-click listener above, so this reads the feedback area's class
+      // only once Verify has already updated it in the same click).
+      if (revealBtn && hasRevealBack) {
+        container.querySelectorAll<HTMLButtonElement>('[data-verify-block]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const area = container.querySelector<HTMLElement>(`[data-feedback-area="${btn.dataset.verifyBlock}"]`);
+            if (area?.classList.contains('correct')) pinToast(revealBtn, 'Click to flip', 3000);
+          });
+        });
+      }
     }
     if (isFlashcard) wirePronunciationIcons(container);
 
