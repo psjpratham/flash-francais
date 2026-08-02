@@ -30,7 +30,10 @@ function createQueryBuilder(resolve: (calls: Call[]) => { data: unknown[]; error
 }
 
 const DUE_FIXTURE = [{ id: 'due-1', state: 'review' }, { id: 'due-2', state: 'review' }];
-const NEW_FIXTURE = [{ id: 'new-1', state: 'new' }, { id: 'new-2', state: 'new' }];
+const NEW_FIXTURE = [
+  { id: 'new-1', state: 'new', stack_id: 'stack-a' },
+  { id: 'new-2', state: 'new', stack_id: 'stack-a' },
+];
 
 const builderLog: Call[][] = [];
 
@@ -50,7 +53,7 @@ vi.mock('./supabase', () => ({
   },
 }));
 
-const { loadQueueForDeck } = await import('./cards');
+const { loadQueueForDeck, roundRobinByStack } = await import('./cards');
 
 function testDeck(overrides: Partial<Deck> = {}): Deck {
   return {
@@ -88,7 +91,7 @@ describe('loadQueueForDeck', () => {
       (calls) => calls.some((c) => c.method === 'eq' && c.args[0] === 'state' && c.args[1] === 'new'),
     )!;
     expect(dueCalls.find((c) => c.method === 'limit')?.args).toEqual([25]);
-    expect(newCalls.find((c) => c.method === 'limit')?.args).toEqual([3]);
+    expect(newCalls.find((c) => c.method === 'limit')?.args).toEqual([30]);
   });
 
   it('never filters by tag or anything else — Practice is deliberately unfilterable', async () => {
@@ -107,5 +110,34 @@ describe('loadQueueForDeck', () => {
     for (const calls of builderLog) {
       expect(calls.some((c) => c.method === 'eq' && c.args[0] === 'include_in_practice' && c.args[1] === true)).toBe(true);
     }
+  });
+});
+
+describe('roundRobinByStack', () => {
+  /** created_at order in, id order out — stack a's cards were all bulk-imported first, so they lead b's and c's. */
+  function item(id: string, stack_id: string) {
+    return { id, stack_id };
+  }
+
+  it('interleaves across stacks instead of draining one stack before the next', () => {
+    const items = [
+      item('a1', 'a'),
+      item('a2', 'a'),
+      item('a3', 'a'),
+      item('b1', 'b'),
+      item('b2', 'b'),
+      item('c1', 'c'),
+    ];
+    expect(roundRobinByStack(items, 6).map((i) => i.id)).toEqual(['a1', 'b1', 'c1', 'a2', 'b2', 'a3']);
+  });
+
+  it('stops at the limit without needing to exhaust every stack', () => {
+    const items = [item('a1', 'a'), item('a2', 'a'), item('b1', 'b'), item('b2', 'b')];
+    expect(roundRobinByStack(items, 3).map((i) => i.id)).toEqual(['a1', 'b1', 'a2']);
+  });
+
+  it('keeps cycling through remaining stacks once one runs out', () => {
+    const items = [item('a1', 'a'), item('b1', 'b'), item('b2', 'b'), item('b3', 'b')];
+    expect(roundRobinByStack(items, 4).map((i) => i.id)).toEqual(['a1', 'b1', 'b2', 'b3']);
   });
 });

@@ -68,6 +68,44 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 /**
+ * Takes up to `limit` items round-robin across stacks, preserving each
+ * stack's own relative order (and the order stacks first appear in `items`)
+ * rather than draining one stack before ever touching the next. `items`
+ * arriving in created_at order means a bulk-imported stack — a whole
+ * textbook page's cards land with near-identical timestamps — no longer
+ * fills the entire new-card slice by itself every session; every stack with
+ * anything left gets a turn each pass instead.
+ */
+export function roundRobinByStack<T extends { stack_id: string }>(items: T[], limit: number): T[] {
+  const byStack = new Map<string, T[]>();
+  const stackOrder: string[] = [];
+  for (const item of items) {
+    let queue = byStack.get(item.stack_id);
+    if (!queue) {
+      queue = [];
+      byStack.set(item.stack_id, queue);
+      stackOrder.push(item.stack_id);
+    }
+    queue.push(item);
+  }
+  const result: T[] = [];
+  let addedAny = true;
+  while (result.length < limit && addedAny) {
+    addedAny = false;
+    for (const stackId of stackOrder) {
+      if (result.length >= limit) break;
+      const queue = byStack.get(stackId)!;
+      const next = queue.shift();
+      if (next) {
+        result.push(next);
+        addedAny = true;
+      }
+    }
+  }
+  return result;
+}
+
+/**
  * Builds a practice queue for a deck: due cards + new cards (up to the
  * deck's daily limits), lightly shuffled. Only cards explicitly marked
  * include_in_practice ever enter the queue — a never-sent imported card
@@ -97,6 +135,15 @@ export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
     .lte('due', nowISO)
     .order('due', { ascending: true })
     .limit(deck.review_per_day * 5);
+  // Same over-fetch-then-narrow shape as the due query above, but narrowed
+  // by roundRobinByStack instead of shuffle — a bulk import (a whole
+  // textbook page's worth of cards, all sharing near-identical created_at)
+  // would otherwise fill the entire new-card slice by itself, every single
+  // session, until that one stack's backlog is fully exhausted. Kept in
+  // created_at order (not shuffled) going in and coming out: within each
+  // stack, and across which stack goes first, earlier-imported material
+  // still surfaces before later material — only *which stack* gets the next
+  // pick is interleaved.
   const newQuery = supabase
     .from('cards')
     .select('*,import_pages(rendered_page_path)')
@@ -104,14 +151,15 @@ export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
     .eq('include_in_practice', true)
     .eq('state', 'new')
     .order('created_at', { ascending: true })
-    .limit(deck.new_per_day);
+    .limit(deck.new_per_day * 10);
 
   const [dueRes, newRes] = await Promise.all([dueQuery, newQuery]);
   if (dueRes.error) throw dueRes.error;
   if (newRes.error) throw newRes.error;
 
   const dueCards = shuffle(dueRes.data).slice(0, deck.review_per_day);
-  return shuffle([...dueCards, ...newRes.data]) as CardWithNote[];
+  const newCards = roundRobinByStack(newRes.data as { stack_id: string }[], deck.new_per_day);
+  return shuffle([...dueCards, ...newCards]) as CardWithNote[];
 }
 
 /**
