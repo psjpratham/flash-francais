@@ -86,7 +86,7 @@ describe('loadQueueForDeck', () => {
     const newCalls = builderLog.find(
       (calls) => calls.some((c) => c.method === 'eq' && c.args[0] === 'state' && c.args[1] === 'new'),
     )!;
-    expect(dueCalls.find((c) => c.method === 'limit')?.args).toEqual([5]);
+    expect(dueCalls.find((c) => c.method === 'limit')?.args).toEqual([25]);
     expect(newCalls.find((c) => c.method === 'limit')?.args).toEqual([3]);
   });
 

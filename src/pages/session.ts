@@ -505,14 +505,12 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     }
   }
 
-  /** Grades the current card: fly-off animation, commit via FSRS, then advance. Same path for buttons and swipe. */
+  /** Grades the current card: fly-off animation, commit via FSRS, then advance. Same path for buttons and swipe. A failed commit must NOT advance/count the card — otherwise the session looks graded while the DB still has the old (already-past) due date, and the card silently reappears next queue pull as if grading had no effect. */
   async function grade(g: Rating): Promise<void> {
     const card = queue[pos];
     const gi = g - 1;
-    sessRatings[g] += 1;
     const retention = deckFor(card).desired_retention;
     const when = previewAll(card, retention)[g];
-    toast(`${GRADE_META[gi].n} — back in ${when}`);
 
     const [dx, dy] = GRADE_DIR[gi];
     const cardEl = document.getElementById('card');
@@ -522,9 +520,27 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       cardEl.style.opacity = '0';
     }
 
-    const commitPromise = commitGrade(card, g, retention).catch((e) => toast('Save failed: ' + errMsg(e)));
+    // Attach the outcome handler immediately (not after the animation delay
+    // below) so a rejection is never left dangling unhandled while we wait.
+    const commitPromise = commitGrade(card, g, retention).then(
+      () => ({ ok: true as const }),
+      (e: unknown) => ({ ok: false as const, e }),
+    );
     await new Promise((r) => setTimeout(r, 320));
-    await commitPromise;
+    const result = await commitPromise;
+
+    if (!result.ok) {
+      toast('Save failed, try grading again: ' + errMsg(result.e));
+      if (cardEl) {
+        cardEl.style.transition = '';
+        cardEl.style.transform = '';
+        cardEl.style.opacity = '';
+      }
+      return;
+    }
+
+    sessRatings[g] += 1;
+    toast(`${GRADE_META[gi].n} — back in ${when}`);
 
     pos += 1;
     flipped = false;

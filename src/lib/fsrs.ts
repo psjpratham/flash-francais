@@ -23,7 +23,17 @@ function retrievability(elapsedDays: number, S: number): number {
   return Math.pow(1 + (FACTOR * elapsedDays) / S, DECAY);
 }
 function intervalDaysForRetention(r: number, S: number): number {
-  return Math.max(1 / 1440, (S / FACTOR) * (Math.pow(r, 1 / DECAY) - 1));
+  // r must be a (0,1) fraction — clamped defensively since this is the one
+  // knob that comes from deck config rather than being derived internally,
+  // and r>=1 would make the pow term negative, collapsing every interval
+  // down to the floor below regardless of grade.
+  const rSafe = Math.min(0.999, Math.max(0.01, r));
+  // Every call site here computes a genuine "graduate into spaced review"
+  // due date (raw learning/relearning step delays are minute-based and
+  // never go through this function) — so a 1-day floor, not a 1-minute
+  // one, is what keeps a just-graduated card from looking "due" again
+  // within the same session.
+  return Math.max(1, (S / FACTOR) * (Math.pow(rSafe, 1 / DECAY) - 1));
 }
 function initialStability(g: Rating): number {
   return Math.max(MIN_S, W[g - 1]);
@@ -46,7 +56,14 @@ function nextStabilityRecall(D: number, S: number, R: number, g: Rating): number
   return Math.max(MIN_S, S * inc);
 }
 function nextStabilityForget(D: number, S: number, R: number): number {
-  return Math.max(MIN_S, W[11] * Math.pow(D, -W[12]) * (Math.pow(S + 1, W[13]) - 1) * Math.exp(W[14] * (1 - R)));
+  const Sf = W[11] * Math.pow(D, -W[12]) * (Math.pow(S + 1, W[13]) - 1) * Math.exp(W[14] * (1 - R));
+  // A lapse must never come out "stronger" than the card was before it
+  // lapsed — clamp to the pre-lapse stability.
+  return Math.min(S, Math.max(MIN_S, Sf));
+}
+/** Same-day restudy (learning/relearning steps): how a grade nudges stability before the card has graduated to full spaced review. */
+function shortTermStability(S: number, g: Rating): number {
+  return Math.max(MIN_S, S * Math.exp(W[17] * (g - 3 + W[18])));
 }
 
 /** Given a card + grade + desired retention, returns the new card fields (does not mutate). */
@@ -94,9 +111,15 @@ export function scheduleCard(card: Card, grade: Rating, retention: number, now?:
     // legitimate state, so a non-null assertion (not a fallback default) is
     // the right way to satisfy the wider (nullable, to allow a fresh
     // imported card) Card type.
-    const difficulty = card.difficulty!;
-    const stability = card.stability!;
     const steps = card.state === 'learning' ? LEARN_STEPS_MIN : RELEARN_STEPS_MIN;
+    // Every re-grade during learning/relearning — not just the one that
+    // graduates the card — nudges difficulty/stability via the same
+    // same-day formulas real FSRS-5 uses (W[17]/W[18], previously unused
+    // here). Without this, a card that started rough (Again/Hard) and was
+    // then graded Easy on its next look would graduate using the original
+    // weak stability, silently discarding the Easy signal.
+    const difficulty = nextDifficulty(card.difficulty!, grade);
+    const stability = shortTermStability(card.stability!, grade);
     out.difficulty = difficulty;
     out.stability = stability;
     if (grade === 1) {
@@ -115,6 +138,7 @@ export function scheduleCard(card: Card, grade: Rating, retention: number, now?:
         out.due = new Date(now + steps[nextStep] * 60000).toISOString();
       } else {
         out.state = 'review';
+        out.step = 0;
         out.due = new Date(now + intervalDaysForRetention(retention, stability) * 86400000).toISOString();
       }
     }
