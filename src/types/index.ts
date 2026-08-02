@@ -48,6 +48,8 @@ export type Deck = {
   status: DeckStatus;
   /** Owner-controlled: when true (and status='published'), readable by every authenticated user and returned by search_public_decks. Independent of the admin-curated 'shared' visibility system. */
   is_public: boolean;
+  /** Set by clone-public-deck when this deck is a copy (via "Add to my decks", or an auto-cloned default) — points at the original. Null for an originally-authored deck. */
+  cloned_from_deck_id: string | null;
   created_at: string;
 };
 

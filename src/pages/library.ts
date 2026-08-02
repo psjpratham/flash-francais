@@ -70,7 +70,6 @@ export async function renderLibrary(container: HTMLElement, deps: LibraryDeps): 
           <div><div class="course-title">${esc(d.name)}</div><div class="course-meta">${esc(d.source)}</div></div>
         </div>
         <div class="course-foot">
-          ${d.visibility === 'shared' ? `<span class="pill">Shared</span>` : ''}
           ${d.status === 'draft' ? `<span class="pill">Draft</span>` : ''}
           ${d._due ? `<span class="pill due">${d._due} due</span>` : ''}
           ${d._new ? `<span class="pill new">${d._new} new</span>` : ''}

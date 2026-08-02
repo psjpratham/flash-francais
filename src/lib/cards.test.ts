@@ -64,6 +64,7 @@ function testDeck(overrides: Partial<Deck> = {}): Deck {
     visibility: 'personal',
     status: 'published',
     is_public: false,
+    cloned_from_deck_id: null,
     created_at: new Date().toISOString(),
     ...overrides,
   };

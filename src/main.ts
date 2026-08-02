@@ -2,7 +2,7 @@ import './style.css';
 import type { Session } from '@supabase/supabase-js';
 import { getMyRole, getSession, onAuthChange, signOut } from './lib/auth';
 import { loadQueueAcrossAllDecks, loadQueueForDeck } from './lib/cards';
-import { listDecksWithCounts } from './lib/decks';
+import { ensureDefaultDecksCloned, listDecksWithCounts } from './lib/decks';
 import { renderAuth } from './pages/auth';
 import { renderResetPassword } from './pages/resetPassword';
 import { renderSettings } from './pages/settings';
@@ -348,6 +348,18 @@ function route(session: Session | null): void {
     })
     .catch(() => {
       /* not fatal — the admin-only monitoring panel just stays hidden */
+    });
+  // Best-effort, once per real sign-in (not token refreshes, thanks to the
+  // wasAuthenticated guard above) — re-render the library afterward so a
+  // freshly-cloned default deck shows up without the learner needing to
+  // manually refresh. Errors are already swallowed inside the function
+  // itself; nothing here should ever block getting to renderView below.
+  ensureDefaultDecksCloned()
+    .then(() => {
+      if (view.name === 'library') renderView(session);
+    })
+    .catch(() => {
+      /* already logged inside ensureDefaultDecksCloned; nothing more to do here */
     });
   renderView(session);
 }

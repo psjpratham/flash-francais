@@ -7,13 +7,23 @@ export function shortDeckId(id: string): string {
 }
 
 /**
- * The decks that belong in "Your decks": ones the current user owns, plus
- * admin-curated `visibility='shared'` decks. Explicitly scoped rather than
- * relying on RLS alone — RLS's decks_select also allows any *other* user's
- * `is_public` deck through (that's what makes search_public_decks work), so
- * an unfiltered select here would leak every public deck into every user's
- * library the moment it's marked public. Public decks are only ever meant
- * to surface via search, never auto-added to anyone's collection.
+ * The decks that belong in "Your decks": only ones the current user actually
+ * owns. Explicitly scoped rather than relying on RLS alone — RLS's
+ * decks_select also allows any *other* user's `is_public` deck through
+ * (that's what makes search_public_decks work), so an unfiltered select here
+ * would leak every public deck into every user's library the moment it's
+ * marked public. Public decks are only ever meant to surface via search,
+ * never auto-added to anyone's collection.
+ *
+ * Admin-curated `visibility='shared'` default decks used to be unioned in
+ * here directly (live-referencing the original rows), which let anyone open
+ * Practice on a deck they didn't actually own — cards_update has no RLS
+ * branch granting write access there (by design, see
+ * 20260814000000_shared_deck_read_access.sql), so every grade silently
+ * failed to save and the same cards never left the queue. Fixed by giving
+ * every user a REAL, fully-owned clone instead (see ensureDefaultDecksCloned)
+ * — once that's guaranteed, this can go back to only ever meaning "decks I
+ * own."
  */
 export async function listDecks(): Promise<Deck[]> {
   const {
@@ -26,10 +36,40 @@ export async function listDecks(): Promise<Deck[]> {
   const { data, error } = await supabase
     .from('decks')
     .select('*')
-    .or(`user_id.eq.${user.id},visibility.eq.shared`)
+    .eq('user_id', user.id)
     .order('created_at', { ascending: true });
   if (error) throw error;
   return data;
+}
+
+/** Every admin-curated default deck currently offered to new/existing users — the catalog ensureDefaultDecksCloned clones from. Readable by anyone via decks_select's `visibility='shared' AND status='published'` branch. */
+async function listSharedDefaultDecks(): Promise<Deck[]> {
+  const { data, error } = await supabase.from('decks').select('*').eq('visibility', 'shared').eq('status', 'published');
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Ensures the signed-in user has their own clone of every current
+ * admin-curated default deck — called once per login (see main.ts), and
+ * safe/cheap to call repeatedly (a no-op once every default is cloned). Each
+ * missing clone is best-effort: one failing (e.g. a transient network blip)
+ * shouldn't block the others or the rest of app startup, so failures are
+ * swallowed here rather than surfaced — the next login retries whatever
+ * didn't finish.
+ */
+export async function ensureDefaultDecksCloned(): Promise<void> {
+  const [defaults, mine] = await Promise.all([listSharedDefaultDecks(), listDecks()]);
+  if (!defaults.length) return;
+  const alreadyCloned = new Set(mine.map((d) => d.cloned_from_deck_id).filter((id): id is string => !!id));
+  const missing = defaults.filter((d) => !alreadyCloned.has(d.id));
+  await Promise.all(
+    missing.map((d) =>
+      addPublicDeckToMyDecks(d.id, d.name).catch((e) => {
+        console.error('ensureDefaultDecksCloned: failed to clone default deck', d.id, e);
+      }),
+    ),
+  );
 }
 
 /** Attaches `_due`/`_new` card counts to each deck (one pair of count queries per deck, run concurrently). */

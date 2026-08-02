@@ -102,12 +102,16 @@ Deno.serve(async (req) => {
 
   const admin = createClient(supabaseUrl, serviceRoleKey);
 
+  // Cloneable either because its author opted it into public discovery
+  // (is_public) or because it's one of the admin-curated defaults every
+  // user gets (visibility='shared') — the latter is what makes
+  // ensureDefaultDecksCloned's per-login catch-up clone possible at all.
   const { data: sourceDeck, error: sourceDeckError } = await admin
     .from('decks')
     .select('*')
     .eq('id', sourceDeckId)
-    .eq('is_public', true)
     .eq('status', 'published')
+    .or('is_public.eq.true,visibility.eq.shared')
     .maybeSingle();
   if (sourceDeckError) return jsonResponse({ ok: false, error: sourceDeckError.message }, 500);
   if (!sourceDeck) return jsonResponse({ ok: false, error: 'Deck not found or not public' }, 404);
@@ -124,6 +128,7 @@ Deno.serve(async (req) => {
       visibility: 'personal',
       status: 'published',
       is_public: false,
+      cloned_from_deck_id: sourceDeck.id,
     })
     .select()
     .single();
