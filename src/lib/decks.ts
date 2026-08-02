@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { toast } from './dom';
 import type { Deck, DeckStatsWithStreak, DeckTagCount, DeckWithCounts, PublicDeckSearchResult } from '../types';
 
 /** The short, human-friendly form of a deck id shown in the UI (deck header, search results) — the id's first 8 hex characters, upper-cased. Search-by-id also matches on this prefix (see search_public_decks). */
@@ -63,6 +64,14 @@ export async function ensureDefaultDecksCloned(): Promise<void> {
   if (!defaults.length) return;
   const alreadyCloned = new Set(mine.map((d) => d.cloned_from_deck_id).filter((id): id is string => !!id));
   const missing = defaults.filter((d) => !alreadyCloned.has(d.id));
+  if (!missing.length) return;
+  // Cloning copies real files (audio, page images) over the network and can
+  // take several seconds — without this, the deck just silently doesn't
+  // appear yet, which reads as "the app is broken" rather than "still
+  // loading" (the natural reaction is to refresh, which used to race a
+  // second clone attempt against this one — see
+  // 20260816000000_dedupe_default_deck_clones.sql).
+  toast('Setting up your default deck…');
   await Promise.all(
     missing.map((d) =>
       addPublicDeckToMyDecks(d.id, d.name).catch((e) => {

@@ -132,6 +132,21 @@ Deno.serve(async (req) => {
     })
     .select()
     .single();
+  if (newDeckError?.code === '23505') {
+    // decks_user_cloned_from_unique — a concurrent call (e.g.
+    // ensureDefaultDecksCloned firing twice, a page refresh landing mid-
+    // clone) already created this exact clone a moment earlier. Not a real
+    // failure: return the winning row so every racing caller converges on
+    // the same single deck instead of one of them erroring.
+    const { data: existing, error: existingError } = await admin
+      .from('decks')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('cloned_from_deck_id', sourceDeck.id)
+      .single();
+    if (existingError || !existing) return jsonResponse({ ok: false, error: existingError?.message ?? 'deck_insert_failed' }, 500);
+    return jsonResponse({ ok: true, deck: existing, cardCount: 0 }, 200);
+  }
   if (newDeckError || !newDeck) return jsonResponse({ ok: false, error: newDeckError?.message ?? 'deck_insert_failed' }, 500);
 
   // From here on, any failure rolls back the partially-created deck (cascade
