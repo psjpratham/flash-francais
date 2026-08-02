@@ -131,8 +131,20 @@ export async function commitGrade(card: Card, grade: Rating, retention: number):
   const now = Date.now();
   const patch = scheduleCard(card, grade, retention, now);
 
-  const { error: cardError } = await supabase.from('cards').update(patch).eq('id', card.id);
+  // .select('id') here is load-bearing, not cosmetic: a RLS policy that
+  // filters out this row (e.g. the caller doesn't actually own the
+  // underlying import for a textbook_extraction card) makes Postgres/
+  // PostgREST return a *successful* response with zero rows affected — no
+  // `error` at all. Without asking for the updated row back, that silent
+  // no-op is indistinguishable from a real save: the toast says "graded",
+  // the session advances, and the due date never actually moved, so the
+  // card just comes back next queue pull looking exactly like the
+  // scheduler is broken.
+  const { data: updated, error: cardError } = await supabase.from('cards').update(patch).eq('id', card.id).select('id');
   if (cardError) throw cardError;
+  if (!updated || updated.length === 0) {
+    throw new Error('Grade did not save (no card row was updated — you may not have edit access to this card)');
+  }
 
   const elapsedDays = card.last_review ? (now - new Date(card.last_review).getTime()) / 86400000 : 0;
   const { error: logError } = await supabase.from('review_log').insert({
