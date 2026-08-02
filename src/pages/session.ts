@@ -377,7 +377,11 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     }
     if (isFlashcard) wirePronunciationIcons(container);
 
-    attachInteractions(isGeneratedOther && !flipped && !verifiedNoFlip, isGeneratedOther && (!hasRevealBack || (!flipped && verifiedNoFlip)));
+    attachInteractions(
+      isGeneratedOther && !flipped && !verifiedNoFlip,
+      isGeneratedOther && (!hasRevealBack || (!flipped && verifiedNoFlip)),
+      isGeneratedOther && !hasRevealBack,
+    );
   }
 
   function renderDone(): void {
@@ -485,7 +489,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     const controls = document.getElementById('controls');
     if (controls) controls.innerHTML = GRADE_ROW_HTML;
     wireGradeButtons(card);
-    attachInteractions(false, true);
+    attachInteractions(false, true, false);
   }
 
   function flip(): void {
@@ -612,15 +616,15 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
    * straight through to native scroll; only a horizontal-dominant drag is
    * ever treated as a swipe.
    */
-  function attachInteractions(suppressGesture: boolean, singleFace = false): void {
+  function attachInteractions(suppressGesture: boolean, singleFace = false, blockVerticalSwipe = singleFace): void {
     const zone = document.getElementById('zone');
     if (!zone) return;
     const cardEl = document.getElementById('card');
     const flipRotate = singleFace ? '' : 'rotateY(180deg)';
 
-    /** For singleFace, a drag that's currently more vertical than horizontal is a scroll attempt, not a swipe — see attachInteractions' own doc comment. */
+    /** For a still-scrollable singleFace (blockVerticalSwipe), a drag that's currently more vertical than horizontal is a scroll attempt, not a swipe — see attachInteractions' own doc comment. A singleFace card that's already been verified correct (enableSwipeGrading) has nothing left to scroll toward, so it opts out via blockVerticalSwipe=false and gets the full 4-direction swipe like a real flipped card. */
     function isScrollAttempt(dx: number, dy: number): boolean {
-      return singleFace && Math.abs(dy) >= Math.abs(dx);
+      return blockVerticalSwipe && Math.abs(dy) >= Math.abs(dx);
     }
 
     /**
