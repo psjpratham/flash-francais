@@ -3,7 +3,7 @@ import { fetchDeckStats } from '../lib/decks';
 import { previewAll } from '../lib/fsrs';
 import { playCardAudio } from '../lib/audioPlayer';
 import type { CardFlashcardContent, CardWithNote, Deck, DeckStatsWithStreak, NoteFields, Rating } from '../types';
-import { $, esc, errMsg, pinToast, toast } from '../lib/dom';
+import { $, esc, errMsg, toast } from '../lib/dom';
 import { barRow } from './statsPanel';
 import { PROFILES, type ChipAs, type ProfileChip } from '../lib/profiles';
 import { computeRevealOutcome, getQuestionText, getRevealAnswerText, pronIconHTML, renderFlashcardDetailHTML, renderReadModeBlock, wirePronunciationIcons, wireReadModeBlock } from '../lib/readModeRenderers';
@@ -87,6 +87,8 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
 
   let pos = 0;
   let flipped = false;
+  /** True once a hasRevealBack generated-other card's Verify comes back correct — grade buttons and the swipe gesture become available on the still-unflipped front, so the learner can swipe it away without tapping Reveal first. Reveal still works normally afterward (flip()'s own guard is untouched) for anyone who wants the fuller back-face detail. Reset alongside `flipped` whenever a new card is shown. */
+  let verifiedNoFlip = false;
   let openChipIndex: number | null = null;
   let visibleChips: ProfileChip[] = [];
   const sessRatings: Record<Rating, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
@@ -359,22 +361,23 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       const revealBtn = container.querySelector<HTMLButtonElement>('[data-reveal-block]');
       revealBtn?.addEventListener('click', flip);
       // If the learner checks their own attempt via Verify instead of just
-      // hitting Reveal, and it comes back correct, nudge them toward the
-      // still-unused Reveal button (added *after* wireReadModeBlock's own
-      // verify-click listener above, so this reads the feedback area's class
-      // only once Verify has already updated it in the same click).
+      // hitting Reveal, and it comes back correct, let them swipe the card
+      // away right away (added *after* wireReadModeBlock's own verify-click
+      // listener above, so this reads the feedback area's class only once
+      // Verify has already updated it in the same click). Reveal stays live
+      // for anyone who still wants the fuller back-face detail.
       if (revealBtn && hasRevealBack) {
         container.querySelectorAll<HTMLButtonElement>('[data-verify-block]').forEach((btn) => {
           btn.addEventListener('click', () => {
             const area = container.querySelector<HTMLElement>(`[data-feedback-area="${btn.dataset.verifyBlock}"]`);
-            if (area?.classList.contains('correct')) pinToast(revealBtn, 'Click to flip', 3000);
+            if (area?.classList.contains('correct') && !verifiedNoFlip) enableSwipeGrading(card);
           });
         });
       }
     }
     if (isFlashcard) wirePronunciationIcons(container);
 
-    attachInteractions(isGeneratedOther && !flipped, isGeneratedOther && !hasRevealBack);
+    attachInteractions(isGeneratedOther && !flipped && !verifiedNoFlip, isGeneratedOther && (!hasRevealBack || (!flipped && verifiedNoFlip)));
   }
 
   function renderDone(): void {
@@ -468,6 +471,23 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     attachInteractions(false, true);
   }
 
+  /**
+   * A hasRevealBack generated-other card's Verify coming back correct: the
+   * learner already knows they got it right without needing the fuller
+   * back-face detail, so grade buttons and the swipe gesture become
+   * available immediately on the still-unflipped front — same trick as
+   * revealGeneratedOther (attachInteractions(false, true), no real face to
+   * rotate to yet), but leaves the Reveal button enabled so flip() still
+   * works normally for anyone who wants that detail.
+   */
+  function enableSwipeGrading(card: CardWithNote): void {
+    verifiedNoFlip = true;
+    const controls = document.getElementById('controls');
+    if (controls) controls.innerHTML = GRADE_ROW_HTML;
+    wireGradeButtons(card);
+    attachInteractions(false, true);
+  }
+
   function flip(): void {
     if (flipped) return;
     flipped = true;
@@ -504,6 +524,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
 
     pos += 1;
     flipped = false;
+    verifiedNoFlip = false;
     openChipIndex = null;
     visibleChips = [];
     render();
@@ -621,7 +642,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     zone.addEventListener(
       'touchmove',
       (e: TouchEvent) => {
-        if (suppressGesture || !dragging || !flipped) return;
+        if (suppressGesture || !dragging || (!flipped && !verifiedNoFlip)) return;
         const t = e.touches[0];
         if (t && isScrollAttempt(t.clientX - sx, t.clientY - sy)) return;
         e.preventDefault();
@@ -651,7 +672,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
       if (Math.abs(dx) > 6 || Math.abs(dy) > 6) moved = true;
-      if (!flipped) return;
+      if (!flipped && !verifiedNoFlip) return;
       if (isScrollAttempt(dx, dy)) return;
       const c = document.getElementById('card');
       const v = document.getElementById('verdict');
@@ -690,11 +711,11 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       }
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
-      if (!moved && !flipped) {
+      if (!moved && !flipped && !verifiedNoFlip) {
         flip();
         return;
       }
-      if (!flipped) {
+      if (!flipped && !verifiedNoFlip) {
         if (c) c.style.transform = '';
         return;
       }
@@ -710,7 +731,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
       cardEl.onclick = (e: MouseEvent) => {
         if (suppressGesture) return;
         if ((e.target as HTMLElement | null)?.closest('.chip, .pron-icon') || moved) return;
-        if (!flipped) flip();
+        if (!flipped && !verifiedNoFlip) flip();
       };
     }
   }
@@ -731,7 +752,7 @@ export function renderSession(container: HTMLElement, decks: Map<string, Deck>, 
     }
 
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    if (k in KEY_GRADE && flipped && !inPanel) {
+    if (k in KEY_GRADE && (flipped || verifiedNoFlip) && !inPanel) {
       e.preventDefault();
       void grade((KEY_GRADE[k] + 1) as Rating);
       return;

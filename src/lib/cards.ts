@@ -83,6 +83,11 @@ function shuffle<T>(arr: T[]): T[] {
 export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
   const nowISO = new Date().toISOString();
 
+  // Pull a larger due pool than we'll actually use (most-overdue-first, so
+  // nothing genuinely stale gets starved), then shuffle and slice to the
+  // daily limit. Slicing by due-order directly would grab whichever stack
+  // happened to be reviewed together last time (they all come due together),
+  // producing sessions dominated by one or two stacks.
   const dueQuery = supabase
     .from('cards')
     .select('*,import_pages(rendered_page_path)')
@@ -91,7 +96,7 @@ export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
     .neq('state', 'new')
     .lte('due', nowISO)
     .order('due', { ascending: true })
-    .limit(deck.review_per_day);
+    .limit(deck.review_per_day * 5);
   const newQuery = supabase
     .from('cards')
     .select('*,import_pages(rendered_page_path)')
@@ -105,7 +110,8 @@ export async function loadQueueForDeck(deck: Deck): Promise<CardWithNote[]> {
   if (dueRes.error) throw dueRes.error;
   if (newRes.error) throw newRes.error;
 
-  return shuffle([...dueRes.data, ...newRes.data]) as CardWithNote[];
+  const dueCards = shuffle(dueRes.data).slice(0, deck.review_per_day);
+  return shuffle([...dueCards, ...newRes.data]) as CardWithNote[];
 }
 
 /**
