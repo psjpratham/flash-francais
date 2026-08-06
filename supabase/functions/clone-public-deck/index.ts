@@ -39,6 +39,7 @@ import '@supabase/functions-js/edge-runtime.d.ts';
 // have direct RLS access to read.
 
 import { createClient } from '@supabase/supabase-js';
+import { copyStorageObject } from '../_shared/storageCopy.ts';
 
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -52,21 +53,6 @@ function jsonResponse(body: unknown, status: number): Response {
 
 const BUCKET_RENDERS = 'import-page-renders';
 const BUCKET_AUDIO = 'import-audio';
-
-/** Downloads a file and re-uploads it under a new path, in the same bucket. Throws on either failure. */
-async function copyStorageObject(
-  // deno-lint-ignore no-explicit-any
-  admin: any,
-  bucket: string,
-  fromPath: string,
-  toPath: string,
-  contentType?: string,
-): Promise<void> {
-  const { data: blob, error: downloadError } = await admin.storage.from(bucket).download(fromPath);
-  if (downloadError || !blob) throw new Error(`download_failed(${bucket}/${fromPath}): ${downloadError?.message ?? 'no data'}`);
-  const { error: uploadError } = await admin.storage.from(bucket).upload(toPath, blob, { contentType: contentType ?? blob.type, upsert: true });
-  if (uploadError) throw new Error(`upload_failed(${bucket}/${toPath}): ${uploadError.message}`);
-}
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });

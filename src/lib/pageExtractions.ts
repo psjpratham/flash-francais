@@ -195,14 +195,91 @@ export async function retryOneExtractionJob(jobId: string): Promise<void> {
   if (error) throw error;
 }
 
-/** Queues a fresh re-extraction of one page (a new page_extractions version), optionally with admin guidance for the repair/extraction prompt. Never touches other pages. */
-export async function requeuePageExtraction(importId: string, deckId: string, pageId: string, adminInstructions?: string): Promise<void> {
-  const { error } = await supabase.from('jobs').insert({
-    type: JOB_TYPE,
-    deck_id: deckId,
-    payload: { import_id: importId, page_id: pageId, admin_instructions: adminInstructions ?? null },
-  });
+/** Queues a fresh re-extraction of one page (a new page_extractions version), optionally with admin guidance for the repair/extraction prompt. Never touches other pages. Returns the new job's id so a caller can poll it. */
+export async function requeuePageExtraction(importId: string, deckId: string, pageId: string, adminInstructions?: string): Promise<string> {
+  const { data, error } = await supabase
+    .from('jobs')
+    .insert({
+      type: JOB_TYPE,
+      deck_id: deckId,
+      payload: { import_id: importId, page_id: pageId, admin_instructions: adminInstructions ?? null },
+    })
+    .select('id')
+    .single();
   if (error) throw error;
+  return data.id;
+}
+
+const GENERATE_CARDS_JOB_TYPE = 'generate_cards';
+
+/**
+ * Queues an AI card-generation job scoped to one page's stack — either
+ * "regenerate this card" (anchorCardId set: the new card lands immediately
+ * after it, original untouched) or "add more cards" (anchorCardId null: new
+ * cards land at the end). Never a new stack version, unlike
+ * requeuePageExtraction — this only ever adds cards to the existing one.
+ */
+export async function queueGenerateCardsJob(
+  deckId: string,
+  stackId: string,
+  sourcePageId: string,
+  instructions: string,
+  anchorCardId: string | null,
+): Promise<string> {
+  const { data, error } = await supabase
+    .from('jobs')
+    .insert({
+      type: GENERATE_CARDS_JOB_TYPE,
+      deck_id: deckId,
+      payload: { deck_id: deckId, stack_id: stackId, source_page_id: sourcePageId, instructions, anchor_card_id: anchorCardId },
+    })
+    .select('id')
+    .single();
+  if (error) throw error;
+  return data.id;
+}
+
+/** Deletes one stack version (e.g. the version left behind after a whole-page re-extraction) — cascades to every card that belonged to it. Never touches the import or any other version. */
+export async function deleteStackVersion(stackId: string): Promise<void> {
+  const { error } = await supabase.from('stacks').delete().eq('id', stackId);
+  if (error) throw error;
+}
+
+export interface ActiveCardJob {
+  id: string;
+  type: 'extract_page' | 'generate_cards';
+  status: 'queued' | 'processing';
+  payload: Record<string, unknown>;
+}
+
+/**
+ * Whether a re-extraction or card-generation job is still queued/processing
+ * for this page — checked fresh from the DB on every page-review load, never
+ * trusted to an in-memory flag. Without this, navigating away mid-job (or
+ * just refreshing the tab) and coming back would show no loader at all with
+ * no way to tell whether the job is still running, already finished, or
+ * failed — the same "never assumes a browser drove any of this" principle
+ * importProgress.ts already follows for the whole-import progress bar.
+ */
+export async function findActiveJobForPage(pageId: string): Promise<ActiveCardJob | null> {
+  const [extractResult, generateResult] = await Promise.all([
+    supabase.from('jobs').select('id, type, status, payload, created_at').eq('type', JOB_TYPE).eq('payload->>page_id', pageId).in('status', ['queued', 'processing']).order('created_at', { ascending: false }).limit(1),
+    supabase
+      .from('jobs')
+      .select('id, type, status, payload, created_at')
+      .eq('type', GENERATE_CARDS_JOB_TYPE)
+      .eq('payload->>source_page_id', pageId)
+      .in('status', ['queued', 'processing'])
+      .order('created_at', { ascending: false })
+      .limit(1),
+  ]);
+  if (extractResult.error) throw extractResult.error;
+  if (generateResult.error) throw generateResult.error;
+  const candidates = [...(extractResult.data ?? []), ...(generateResult.data ?? [])];
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  const top = candidates[0];
+  return { id: top.id, type: top.type as ActiveCardJob['type'], status: top.status as ActiveCardJob['status'], payload: top.payload };
 }
 
 /**
@@ -227,6 +304,21 @@ export async function requeueStaleExtractionJobs(importId: string): Promise<numb
 // ---------- page_extractions / page_blocks read + review actions ----------
 
 /** The current (max-version) extraction for a page, or null if it hasn't been extracted yet. */
+/**
+ * The current (max-version) extraction for a page, or null if it hasn't
+ * been extracted yet. A page whose cards live entirely in an import-wide
+ * merged 'custom' stack (a prompt-only or image-source import) has no
+ * kind='page' extraction-attempt stack of its own to find here — verified
+ * directly against real cloned decks, where clone-public-deck only copies
+ * stacks actually referenced by a card, silently dropping this page's own
+ * (0-card) bookkeeping stack. Falls back to the import's shared merged
+ * stack so Manage still has something real to show instead of treating an
+ * already-extracted, card-bearing page as if it were never extracted.
+ * Callers that might delete "the old version" (doReExtract in
+ * pageReview.ts) must never treat this fallback stack as safe to delete —
+ * it holds every other page's cards too, not just this one's — see the
+ * kind==='page' guards there.
+ */
 export async function getCurrentPageExtraction(pageId: string): Promise<PageExtraction | null> {
   const { data, error } = await supabase
     .from('stacks')
@@ -236,7 +328,15 @@ export async function getCurrentPageExtraction(pageId: string): Promise<PageExtr
     .limit(1)
     .maybeSingle();
   if (error) throw error;
-  return data;
+  if (data) return data;
+
+  const { data: page, error: pageError } = await supabase.from('import_pages').select('import_id').eq('id', pageId).maybeSingle();
+  if (pageError || !page) return null;
+  const { data: imp, error: impError } = await supabase.from('imports').select('merged_stack_id').eq('id', page.import_id).maybeSingle();
+  if (impError || !imp?.merged_stack_id) return null;
+  const { data: mergedStack, error: mergedError } = await supabase.from('stacks').select('*').eq('id', imp.merged_stack_id).maybeSingle();
+  if (mergedError) throw mergedError;
+  return mergedStack;
 }
 
 export async function listPageBlocks(pageExtractionId: string): Promise<PageBlock[]> {

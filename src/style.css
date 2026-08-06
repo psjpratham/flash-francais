@@ -413,6 +413,7 @@ table.diag-table td.wrap{white-space:normal;max-width:220px}
 .field{margin-bottom:12px}
 .field label{display:block;font-size:12.5px;color:var(--ink-soft);margin-bottom:5px;font-weight:500}
 .field input{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--canvas)}
+.field textarea{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--canvas);font-family:inherit;font-size:14px;resize:vertical}
 .checkbox-field{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;line-height:1.4}
 .checkbox-field input{margin-top:2px}
 .btn-primary{width:100%;background:var(--indigo);color:#fff;padding:12px;border-radius:var(--r-md);font-weight:600;font-size:14.5px;margin-top:6px;display:flex;align-items:center;justify-content:center}
@@ -719,6 +720,8 @@ kbd{font-family:'IBM Plex Mono',monospace;font-size:10.5px;background:var(--canv
 .page-status-badge.extracting{background:var(--indigo-soft);color:var(--indigo)}
 .page-status-badge.completed{background:var(--green-soft);color:var(--green-strong)}
 .page-status-badge.completed_with_errors{background:var(--amber-soft);color:var(--amber-strong)}
+
+.sync-history-list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--ink-soft)}
 
 /* ===== stacks browser ===== */
 .stack-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}

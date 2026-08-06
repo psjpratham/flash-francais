@@ -1,12 +1,15 @@
-import type { ImportAudioFile, ImportPage, PageBlock, PageBlockKind, PageExtraction } from '../types';
-import { $, confirmDialog, errMsg, esc, toast } from '../lib/dom';
+import type { ImportAudioFile, ImportPage, Job, PageBlock, PageBlockKind, PageExtraction } from '../types';
+import { $, confirmDialog, errMsg, esc, textareaDialog, toast } from '../lib/dom';
 import { getImportById, getLatestImportForDeck, listImportAudioFiles, listImportPages } from '../lib/imports';
 import {
   countBlocksSentToPractice,
   deletePageBlock,
+  deleteStackVersion,
+  findActiveJobForPage,
   getCurrentPageExtraction,
   insertPageBlock,
   listCardsForSourcePage,
+  queueGenerateCardsJob,
   removePageBlocksFromPractice,
   reorderPageBlocks,
   requeuePageExtraction,
@@ -22,6 +25,9 @@ import { componentTypeLabel } from '../lib/blockRenderers';
 import { computeRevealOutcome, renderReadModeBlock, wireReadModeBlock } from '../lib/readModeRenderers';
 import { formatNumberedSourceLines } from '../lib/sourceLines';
 import { parseContentFields, renderContentFieldsHTML } from '../lib/cardEditorFields';
+import { pollJob } from '../lib/jobPolling';
+import type { ImportProgress } from '../lib/importProgress';
+import { renderImportProgress } from './importProgressView';
 
 type ViewMode = 'read' | 'rearrange';
 
@@ -74,6 +80,9 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
   let dragBlockId: string | null = null;
   /** Which card's "Ask AI to change this card" box is expanded — at most one at a time. */
   let promptEditOpenFor: string | null = null;
+  /** Set while a re-extract / regenerate-card / add-more-cards job is in flight — drives the loader banner and disables the buttons that would start another one. Only one such job runs at a time per page. */
+  let activeJob: { label: string } | null = null;
+  let stopJobPoll: (() => void) | null = null;
 
   function audioFilesById(): Map<string, ImportAudioFile> {
     return new Map(audioFiles.map((a) => [a.id, a]));
@@ -132,6 +141,10 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
 
   async function loadCurrentPage(): Promise<void> {
     const page = currentPage();
+    stopJobPoll?.();
+    stopJobPoll = null;
+    activeJob = null;
+    busy = false;
     extraction = null;
     blocks = [];
     renderedImageUrl = null;
@@ -144,10 +157,72 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
       blocks = extraction ? await listCardsForSourcePage(page.id) : [];
       if (page.rendered_page_path) renderedImageUrl = await getRenderedPageUrl(page.rendered_page_path);
       sentToPracticeCount = blocks.length ? await countBlocksSentToPractice(blocks.map((b) => b.id)) : 0;
+      await resumeActiveJobIfAny(page.id);
     } catch (e) {
       toast('Could not load page: ' + errMsg(e));
     }
     render();
+  }
+
+  /**
+   * Re-attaches to a still-running re-extract/regenerate/add-more-cards job
+   * for this page, if one exists — checked fresh from the DB (see
+   * findActiveJobForPage), never assumed from in-memory state. Without this,
+   * leaving and returning to the manage page (or a plain refresh) mid-job
+   * would show no loader at all with no way to tell it's still running.
+   */
+  async function resumeActiveJobIfAny(pageId: string): Promise<void> {
+    let job;
+    try {
+      job = await findActiveJobForPage(pageId);
+    } catch {
+      return; // best-effort — the job itself keeps running server-side regardless
+    }
+    if (!job) return;
+    if (job.type === 'extract_page') {
+      // Only a genuine kind='page' extraction-attempt stack is ever safe to
+      // offer for deletion here — getCurrentPageExtraction can fall back to
+      // an import-wide merged 'custom' stack when this page has no
+      // kind='page' stack of its own (a prompt-only/image-source import),
+      // and that stack holds every OTHER page's cards too. Deleting it as
+      // if it were "the old version" of just this one page would wipe out
+      // the whole import's cards, not just this page's.
+      const oldStackId = extraction?.kind === 'page' ? extraction.id : null;
+      busy = true;
+      activeJob = { label: 'Re-extracting this page…' };
+      stopJobPoll = pollJob(job.id, (updated) => {
+        if (updated.status === 'completed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          void onReExtractComplete(oldStackId);
+        } else if (updated.status === 'failed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          activeJob = null;
+          busy = false;
+          toast('Re-extraction failed: ' + (updated.error ?? 'unknown error'));
+          render();
+        }
+      });
+    } else {
+      const anchorCardId = (job.payload.anchor_card_id as string | null) ?? null;
+      busy = true;
+      activeJob = { label: anchorCardId ? 'Regenerating card…' : 'Generating new cards…' };
+      stopJobPoll = pollJob(job.id, (updated) => {
+        if (updated.status === 'completed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          void onGenerateCardsComplete(updated, anchorCardId);
+        } else if (updated.status === 'failed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          activeJob = null;
+          busy = false;
+          toast('Card generation failed: ' + (updated.error ?? 'unknown error'));
+          render();
+        }
+      });
+    }
   }
 
   function goTo(index: number): void {
@@ -244,26 +319,134 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     }
   }
 
-  async function doReExtract(withInstructions: boolean): Promise<void> {
+  /** Whole-page re-extraction — always goes through the same instructions dialog (an empty answer is just today's plain retry); a new stack version is created and the old one is left in place until the admin explicitly chooses to delete it. */
+  async function doReExtract(): Promise<void> {
     const page = currentPage();
-    if (!page || busy) return;
-    let instructions: string | undefined;
-    if (withInstructions) {
-      instructions = window.prompt('Admin instructions for re-extraction (what should change?)') ?? undefined;
-      if (instructions === undefined) return; // cancelled
-    }
+    if (!page || busy || activeJob || !importId) return;
+    const instructions = await textareaDialog('Re-extract this page', {
+      placeholder: 'Optional instructions — what should change? Leave blank to just retry as-is.',
+      confirmLabel: 'Re-extract',
+      allowEmpty: true,
+    });
+    if (instructions === null) return; // cancelled
+    // Only a genuine kind='page' stack is ever safe to offer for deletion —
+    // see the matching guard/comment in resumeActiveJobIfAny.
+    const oldStackId = extraction?.kind === 'page' ? extraction.id : null;
     busy = true;
+    activeJob = { label: 'Re-extracting this page…' };
+    showMoreActions = false;
     render();
-    if (!importId) return;
     try {
-      await requeuePageExtraction(importId, deps.deckId, page.id, instructions);
-      toast('Re-extraction queued — run the import pipeline again to process it.');
+      const jobId = await requeuePageExtraction(importId, deps.deckId, page.id, instructions || undefined);
+      stopJobPoll = pollJob(jobId, (job) => {
+        if (job.status === 'completed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          void onReExtractComplete(oldStackId);
+        } else if (job.status === 'failed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          activeJob = null;
+          busy = false;
+          toast('Re-extraction failed: ' + (job.error ?? 'unknown error'));
+          render();
+        }
+      });
     } catch (e) {
-      toast('Could not queue re-extraction: ' + errMsg(e));
-    } finally {
+      activeJob = null;
       busy = false;
+      toast('Could not queue re-extraction: ' + errMsg(e));
       render();
     }
+  }
+
+  async function onReExtractComplete(oldStackId: string | null): Promise<void> {
+    activeJob = null;
+    busy = false;
+    await loadCurrentPage(); // reloads extraction/blocks/counts and re-renders
+    if (oldStackId && extraction && extraction.id !== oldStackId) {
+      const shouldDelete = await confirmDialog(`New version created (v${extraction.version}). Delete the old version?`);
+      if (shouldDelete) {
+        try {
+          await deleteStackVersion(oldStackId);
+          toast('Old version deleted.');
+        } catch (e) {
+          toast('Could not delete old version: ' + errMsg(e));
+        }
+      }
+    }
+  }
+
+  /** Stack-level "add more cards" — same generate_cards job as regenerate-a-card, just with no anchor (new cards land at the end). */
+  async function doAddMoreCards(): Promise<void> {
+    if (!currentPage() || !extraction || busy || activeJob) return;
+    const instructions = await textareaDialog('Add more cards to this stack', {
+      placeholder: 'Describe what new cards to add — e.g. "add 5 more flashcards for the remaining vocabulary on this page."',
+      confirmLabel: 'Add cards',
+    });
+    if (!instructions) return; // cancelled, or left blank (required here — see allowEmpty default)
+    showMoreActions = false;
+    await startGenerateCardsJob(null, instructions);
+  }
+
+  /** Regenerating one existing card — anchored so the new card lands immediately after the original, which stays untouched. */
+  async function doRegenerateCard(blockId: string, instructions: string): Promise<void> {
+    await startGenerateCardsJob(blockId, instructions);
+  }
+
+  async function startGenerateCardsJob(anchorCardId: string | null, instructions: string): Promise<void> {
+    const page = currentPage();
+    if (!page || !extraction || busy || activeJob) return;
+    const stackId = blocks[0]?.stack_id ?? extraction.id;
+    busy = true;
+    activeJob = { label: anchorCardId ? 'Regenerating card…' : 'Generating new cards…' };
+    editingBlockId = null;
+    promptEditOpenFor = null;
+    render();
+    try {
+      const jobId = await queueGenerateCardsJob(deps.deckId, stackId, page.id, instructions, anchorCardId);
+      stopJobPoll = pollJob(jobId, (job) => {
+        if (job.status === 'completed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          void onGenerateCardsComplete(job, anchorCardId);
+        } else if (job.status === 'failed') {
+          stopJobPoll?.();
+          stopJobPoll = null;
+          activeJob = null;
+          busy = false;
+          toast('Card generation failed: ' + (job.error ?? 'unknown error'));
+          render();
+        }
+      });
+    } catch (e) {
+      activeJob = null;
+      busy = false;
+      toast('Could not queue card generation: ' + errMsg(e));
+      render();
+    }
+  }
+
+  async function onGenerateCardsComplete(job: Job, anchorCardId: string | null): Promise<void> {
+    activeJob = null;
+    busy = false;
+    const page = currentPage();
+    if (!page) {
+      render();
+      return;
+    }
+    try {
+      blocks = await listCardsForSourcePage(page.id);
+      sentToPracticeCount = blocks.length ? await countBlocksSentToPractice(blocks.map((b) => b.id)) : 0;
+      const newIds = (job.result?.new_card_ids as string[] | undefined) ?? [];
+      const firstNewIdx = newIds.length ? blocks.findIndex((b) => b.id === newIds[0]) : -1;
+      if (firstNewIdx >= 0) cardCursor = firstNewIdx;
+      viewMode = 'read';
+      toast(anchorCardId ? 'New card added — the previous version is just before it.' : `${newIds.length} new card(s) added.`);
+    } catch (e) {
+      toast('Card generated, but could not refresh the list: ' + errMsg(e));
+    }
+    render();
   }
 
   async function doDeleteBlock(blockId: string): Promise<void> {
@@ -427,6 +610,22 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     if (pages.length) wireBody();
   }
 
+  /** Loader banner for whichever AI job (re-extract / regenerate card / add more cards) is currently running — one shared treatment for all three, so the UI reads the same way regardless of which button started it. */
+  function renderActiveJobBanner(): string {
+    if (!activeJob) return '';
+    const progress: ImportProgress = {
+      status: 'running',
+      currentStage: activeJob.label,
+      totalUnits: null,
+      completedUnits: 0,
+      failedUnits: 0,
+      percent: 0,
+      indeterminate: true,
+      message: '',
+    };
+    return `<div class="panelbox active-job-banner">${renderImportProgress(progress, { compact: true })}</div>`;
+  }
+
   /** Prev/Next + jump strip across THIS import's own pages (e.g. a multi-page PDF) — nothing to do with the Stacks browser's stacks. Omitted entirely for a single-page import, where there's nothing to navigate. */
   function renderPageNav(): string {
     if (pages.length <= 1) return '';
@@ -495,14 +694,15 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
             ${
               showMoreActions
                 ? `<div class="toolbar-more-menu">
-                     <button class="btn-sec" id="reExtractBtn" ${busy ? 'disabled' : ''}>Re-extract</button>
-                     <button class="btn-sec" id="reExtractInstructionsBtn" ${busy ? 'disabled' : ''}>Re-extract with instructions</button>
+                     <button class="btn-sec" id="reExtractBtn" ${busy || activeJob ? 'disabled' : ''}>Re-extract this page…</button>
+                     <button class="btn-sec" id="addMoreCardsBtn" ${busy || activeJob ? 'disabled' : ''}>➕ Add more cards…</button>
                    </div>`
                 : ''
             }
           </div>
         </div>
       </div>
+      ${renderActiveJobBanner()}
       <div class="page-bulk-actions">
         <div class="bulk-panel">
           <div class="bulk-panel-head"><span class="bulk-panel-icon">📇</span>Practice inclusion</div>
@@ -706,12 +906,12 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
         <div class="field"><label>Tags <span class="field-hint">— comma separated</span></label><input name="meta_tags" value="${esc((block.tags ?? []).join(', '))}"></div>
 
         <div class="prompt-edit">
-          <button type="button" class="btn-sec" data-prompt-edit-toggle="${esc(block.id)}">✨ Ask AI to change this card</button>
+          <button type="button" class="btn-sec" data-prompt-edit-toggle="${esc(block.id)}" ${busy || activeJob ? 'disabled' : ''}>✨ Ask AI to change this card</button>
           ${
             promptEditOpen
               ? `<div class="prompt-edit-box">
                    <textarea rows="3" placeholder="Describe what you want changed — e.g. “turn this into a fill-in-the-blank” or “make the translation more natural”"></textarea>
-                   <button type="button" class="btn-primary" style="width:auto" data-prompt-edit-submit="${esc(block.id)}">Submit</button>
+                   <button type="button" class="btn-primary" style="width:auto" data-prompt-edit-submit="${esc(block.id)}" ${busy || activeJob ? 'disabled' : ''}>Submit</button>
                  </div>`
               : ''
           }
@@ -768,8 +968,8 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
       showMoreActions = !showMoreActions;
       render();
     });
-    document.getElementById('reExtractBtn')?.addEventListener('click', () => void doReExtract(false));
-    document.getElementById('reExtractInstructionsBtn')?.addEventListener('click', () => void doReExtract(true));
+    document.getElementById('reExtractBtn')?.addEventListener('click', () => void doReExtract());
+    document.getElementById('addMoreCardsBtn')?.addEventListener('click', () => void doAddMoreCards());
     document.getElementById('sendToPracticeBtn')?.addEventListener('click', () => void doSendToPractice());
     document.getElementById('removeFromPracticeBtn')?.addEventListener('click', () => void doRemoveAllFromPractice());
     document.getElementById('showSourceAllPracticeBtn')?.addEventListener('click', () => void doSetShowSourceAll('show_source_in_practice', true));
@@ -854,7 +1054,14 @@ export async function renderPageReview(container: HTMLElement, deps: PageReviewD
     );
     document.querySelectorAll<HTMLButtonElement>('[data-prompt-edit-submit]').forEach((btn) =>
       btn.addEventListener('click', () => {
-        toast('Coming soon — AI-assisted card editing isn’t wired up yet.');
+        const blockId = btn.dataset.promptEditSubmit!;
+        const textarea = btn.closest('.prompt-edit-box')?.querySelector<HTMLTextAreaElement>('textarea');
+        const instructions = textarea?.value.trim() ?? '';
+        if (!instructions) {
+          toast('Describe what you want changed first.');
+          return;
+        }
+        void doRegenerateCard(blockId, instructions);
       }),
     );
 

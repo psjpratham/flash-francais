@@ -102,6 +102,43 @@ export function promptDialog(title: string, defaultValue = '', confirmLabel = 'S
   });
 }
 
+/**
+ * Same rationale/pattern as promptDialog, but for longer free-text
+ * instructions (AI reextract/regenerate prompts) where a single-line
+ * <input> is too cramped. `allowEmpty` lets a caller treat "submitted with
+ * nothing typed" as a valid, meaningful choice (e.g. "re-extract with no
+ * special instructions") rather than a no-op — promptDialog always requires
+ * non-empty input, this is the one place that can differ.
+ */
+export function textareaDialog(
+  title: string,
+  opts?: { placeholder?: string; defaultValue?: string; confirmLabel?: string; cancelLabel?: string; allowEmpty?: boolean },
+): Promise<string | null> {
+  const { placeholder = '', defaultValue = '', confirmLabel = 'Submit', cancelLabel = 'Cancel', allowEmpty = false } = opts ?? {};
+  return new Promise((resolve) => {
+    let result: string | null = null;
+    const { box, close } = openModal(
+      `<h3>${esc(title)}</h3>
+      <div class="field"><textarea id="textareaDialogInput" rows="4" placeholder="${esc(placeholder)}">${esc(defaultValue)}</textarea></div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn-sec" id="textareaDialogCancel">${esc(cancelLabel)}</button>
+        <button class="btn-primary" style="width:auto" id="textareaDialogOk">${esc(confirmLabel)}</button>
+      </div>`,
+      () => resolve(result),
+    );
+    const textarea = box.querySelector<HTMLTextAreaElement>('#textareaDialogInput')!;
+    textarea.focus();
+    const submit = (): void => {
+      const v = textarea.value.trim();
+      if (!v && !allowEmpty) return;
+      result = v;
+      close();
+    };
+    box.querySelector('#textareaDialogOk')?.addEventListener('click', submit);
+    box.querySelector('#textareaDialogCancel')?.addEventListener('click', close);
+  });
+}
+
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function toast(message: string, durationMs = 1800): void {

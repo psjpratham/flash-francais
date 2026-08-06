@@ -131,9 +131,41 @@ export interface StackTile {
 
 const STATUS_RANK: Record<string, number> = { failed: 2, processing: 1, pending: 1 };
 
+/**
+ * Fallback for representativeSourcePageId below — every import's first page
+ * (by page_index), regardless of whether any `stacks` row currently
+ * references it. Needed because a prompt-only or image-source import's own
+ * kind='page' bookkeeping stack (0 cards, since its real cards all file
+ * into the import's shared merged 'custom' stack instead) isn't guaranteed
+ * to exist: clone-public-deck only copies stacks a card actually
+ * references, so a cloned deck's version of that page has no stack at all —
+ * verified directly against real cloned decks, where this silently made
+ * "Manage" do nothing for every prompt-generated import (representativeSourcePageId
+ * fell through to null with no stack to fall back on).
+ */
+async function listFirstPageIdByImport(deckId: string): Promise<Map<string, string>> {
+  const { data: importRows, error: importsError } = await supabase.from('imports').select('id').eq('deck_id', deckId);
+  if (importsError) throw importsError;
+  const importIds = (importRows ?? []).map((i) => i.id as string);
+  if (!importIds.length) return new Map();
+
+  const { data: pageRows, error: pagesError } = await supabase
+    .from('import_pages')
+    .select('id, import_id, page_index')
+    .in('import_id', importIds)
+    .order('page_index', { ascending: true });
+  if (pagesError) throw pagesError;
+
+  const firstByImport = new Map<string, string>();
+  for (const p of pageRows ?? []) {
+    if (!firstByImport.has(p.import_id)) firstByImport.set(p.import_id, p.id);
+  }
+  return firstByImport;
+}
+
 /** Aggregates listStacksForDeck's per-row data into one tile per import (see StackTile) — the shape both the Manage and Study browsers actually want. */
 export async function listStackTilesForDeck(deckId: string): Promise<StackTile[]> {
-  const rows = await listStacksForDeck(deckId);
+  const [rows, firstPageIdByImport] = await Promise.all([listStacksForDeck(deckId), listFirstPageIdByImport(deckId)]);
   const byImport = new Map<string, StackSummary[]>();
   const handMade: StackSummary[] = [];
   for (const s of rows) {
@@ -177,7 +209,7 @@ export async function listStackTilesForDeck(deckId: string): Promise<StackTile[]
       includedCount: group.reduce((sum, s) => sum + s.includedCount, 0),
       readyCount: group.reduce((sum, s) => sum + s.readyCount, 0),
       stackIds: group.map((s) => s.id),
-      representativeSourcePageId: group.find((s) => s.sourcePageId)?.sourcePageId ?? null,
+      representativeSourcePageId: group.find((s) => s.sourcePageId)?.sourcePageId ?? firstPageIdByImport.get(importId) ?? null,
       failedCount: group.filter((s) => s.status === 'failed').length,
     };
   });

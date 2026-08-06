@@ -13,6 +13,7 @@ import { renderPageReview } from './pages/pageReview';
 import { renderImportContent } from './pages/import';
 import { renderImportDetail } from './pages/importDetail';
 import { renderStacksList } from './pages/stacksList';
+import { renderDeckSync } from './pages/deckSync';
 import { renderStudyPicker } from './pages/studyPicker';
 import { renderStudyMode } from './pages/studyMode';
 import { initAccentKeyboard } from './lib/accentKeyboard';
@@ -37,6 +38,8 @@ type View =
   | { name: 'import-detail'; deckId: string; deckName: string; importId: string }
   /** Manage-content: browse/edit this deck's stacks. Nothing about studying lives here — see 'study-picker'. */
   | { name: 'stacks-list'; deckId: string; deckName: string }
+  /** "Sync with original deck" — its own page (explanation + action + history), not a button buried in an overflow menu. Only reachable for a deck that's actually a clone. */
+  | { name: 'deck-sync'; deckId: string }
   /** Study's own front door — pick which stack(s), optionally narrowed by tag, before handing off to 'study-mode'. */
   | { name: 'study-picker'; deckId: string; deckName: string }
   /** Study mode: no scheduling, just a sequential walk through whichever stack(s) were selected on the Study picker — optionally narrowed by tag. `tileCount` is how many tiles were picked (see StudyPickerDeps.onStudySelected) — what the header should call "N stacks", not stackIds.length. */
@@ -171,6 +174,10 @@ function renderView(session: Session): void {
         view = { name: 'stacks-list', deckId: id, deckName: name };
         renderView(session);
       },
+      onOpenDeckSync: (id) => {
+        view = { name: 'deck-sync', deckId: id };
+        renderView(session);
+      },
     });
     return;
   }
@@ -189,6 +196,16 @@ function renderView(session: Session): void {
       },
       onOpenImportDetail: (id, name, importId) => {
         view = { name: 'import-detail', deckId: id, deckName: name, importId };
+        renderView(session);
+      },
+    });
+    return;
+  }
+  if (view.name === 'deck-sync') {
+    const { deckId } = view;
+    void renderDeckSync(app, deckId, {
+      onBack: () => {
+        view = { name: 'deck', deckId };
         renderView(session);
       },
     });

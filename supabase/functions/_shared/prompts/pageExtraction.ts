@@ -192,7 +192,8 @@ export const COMPOSED_PRIMITIVE_TYPES = [
 
 const RICH_TEXT_SCHEMA = `{ "nodes": [ { "type": "paragraph"|"list_item"|"heading", "spans": [ { "text": string, "bold": boolean|null, "italic": boolean|null } ] } ] }`;
 
-const RECIPE_SCHEMA_SUMMARY = `
+/** Exported so prompts/generateCards.ts can describe the exact same card shape (recipes, content fields, closed lists) rather than re-deriving a second, potentially-drifting copy — both ultimately feed the same validatePage/validateBlock. */
+export const RECIPE_SCHEMA_SUMMARY = `
 BLOCK KINDS: "document" (nothing to answer) | "interaction" (the student answers something) | "image_ref" (a photo/illustration reference) | "audio_ref" (an audio label reference)
 
 Every block may also carry these OPTIONAL top-level fields:

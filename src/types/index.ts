@@ -56,6 +56,18 @@ export type Deck = {
 export type DeckInsert = Pick<Deck, 'name'> &
   Partial<Omit<Deck, 'id' | 'user_id' | 'name' | 'created_at'>>;
 
+/** One past "Sync with original deck" run — written only by the sync_deck worker, never by client code. */
+export type DeckSync = {
+  id: string;
+  deck_id: string;
+  synced_at: string;
+  status: 'completed' | 'failed';
+  error: string | null;
+  stacks_added: number;
+  cards_added: number;
+  imports_added: number;
+};
+
 export type DeckUpdate = Partial<Omit<Deck, 'id' | 'user_id' | 'created_at'>>;
 
 /** Client-side aggregate stitched onto a Deck row after loading counts (not a DB column). */

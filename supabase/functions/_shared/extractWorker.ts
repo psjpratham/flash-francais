@@ -62,8 +62,8 @@ const PAGE_PDF_BUCKET = 'import-page-pdfs';
 const SOURCES_BUCKET = 'import-sources';
 const PAGE_PDF_DOWNLOAD_TIMEOUT_MS = 15_000;
 
-/** Downloads and base64-encodes this page's single-page PDF slice — null (never a thrown error) when there isn't one, so extraction always falls back to text-only rather than failing the job over a missing/broken attachment. */
-async function loadPagePdfBase64(supabase: SupabaseClient, pagePdfPath: string | null): Promise<string | null> {
+/** Downloads and base64-encodes this page's single-page PDF slice — null (never a thrown error) when there isn't one, so extraction always falls back to text-only rather than failing the job over a missing/broken attachment. Exported for generateCardsWorker.ts, which reuses this same page context. */
+export async function loadPagePdfBase64(supabase: SupabaseClient, pagePdfPath: string | null): Promise<string | null> {
   if (!pagePdfPath) return null;
   try {
     const download = supabase.storage.from(PAGE_PDF_BUCKET).download(pagePdfPath);
@@ -791,9 +791,27 @@ async function processClaimedExtractionJob(supabase: SupabaseClient, job: Extrac
     // silently stuck), and the fail_job/finalize calls are themselves
     // best-effort so a failure recording the failure can't compound into
     // the same silent-stuck-forever problem this exists to prevent.
+    //
+    // supabase-js's query/RPC builder is a "thenable" (implements .then
+    // only), not a real Promise — .catch() chained directly on it throws
+    // "not a function" instead of swallowing the error, which defeats the
+    // whole point of "best-effort" above. Verified directly against real
+    // data (syncDeckWorker.ts): this exact pattern silently killed error
+    // reporting, leaving jobs stuck in 'processing' forever with nothing
+    // ever recorded — precisely the failure mode this comment claims to
+    // prevent. A real try/catch is the only safe way to make this
+    // best-effort.
     const message = e instanceof Error ? e.message : String(e);
-    await supabase.rpc('fail_job', { p_job_id: job.id, p_error: `unhandled: ${message}`.slice(0, 2000) }).catch(() => {});
-    await maybeFinalizeImport(supabase, importId).catch(() => {});
+    try {
+      await supabase.rpc('fail_job', { p_job_id: job.id, p_error: `unhandled: ${message}`.slice(0, 2000) });
+    } catch {
+      // best-effort
+    }
+    try {
+      await maybeFinalizeImport(supabase, importId);
+    } catch {
+      // best-effort
+    }
     return { claimed: true, jobId: job.id, error: message };
   }
 }

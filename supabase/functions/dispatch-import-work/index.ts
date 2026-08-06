@@ -26,6 +26,8 @@ import '@supabase/functions-js/edge-runtime.d.ts';
 import { createClient } from '@supabase/supabase-js';
 import { processOnePreprocessJob, requeueStalePreprocessJobs } from '../_shared/preprocessWorker.ts';
 import { processExtractionJobsBatch } from '../_shared/extractWorker.ts';
+import { processGenerateCardsJobsBatch } from '../_shared/generateCardsWorker.ts';
+import { processSyncDeckJobsBatch } from '../_shared/syncDeckWorker.ts';
 
 const BUDGET_MS = 45_000;
 // How many pages to extract concurrently per tick. Bounded conservatively —
@@ -33,6 +35,14 @@ const BUDGET_MS = 45_000;
 // makes its own Gemini request; raise this once real throughput/rate-limit
 // behavior at this batch size has been observed in production.
 const EXTRACTION_BATCH_SIZE = 5;
+// generate_cards jobs are the same shape of work as extract_page (one
+// Gemini call + one page-PDF attachment each) just scoped to fewer cards,
+// so they share the same conservative batch size.
+const GENERATE_CARDS_BATCH_SIZE = 5;
+// sync_deck jobs can copy several pages'/audio files' worth of storage
+// objects each (a whole new import) — kept small so one tick doesn't spend
+// its whole budget on a single large first-time sync.
+const SYNC_DECK_BATCH_SIZE = 2;
 
 function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -59,6 +69,8 @@ Deno.serve(async (req) => {
   const start = Date.now();
   let preprocessClaimed = 0;
   let extractClaimed = 0;
+  let generateCardsClaimed = 0;
+  let syncDeckClaimed = 0;
   let lastError: string | undefined;
 
   // Fallback safety net, not the primary mechanism: the bounded-batch
@@ -91,9 +103,23 @@ Deno.serve(async (req) => {
     const failedExtract = extractResults.find((r) => r.error);
     if (failedExtract) lastError = failedExtract.error;
 
-    if (!preResult.claimed && extractResults.length === 0) break; // nothing left to do right now
+    if (Date.now() - start >= BUDGET_MS) break;
+
+    const generateCardsResults = await processGenerateCardsJobsBatch(supabase, GENERATE_CARDS_BATCH_SIZE);
+    generateCardsClaimed += generateCardsResults.filter((r) => r.claimed).length;
+    const failedGenerateCards = generateCardsResults.find((r) => r.error);
+    if (failedGenerateCards) lastError = failedGenerateCards.error;
+
+    if (Date.now() - start >= BUDGET_MS) break;
+
+    const syncDeckResults = await processSyncDeckJobsBatch(supabase, SYNC_DECK_BATCH_SIZE);
+    syncDeckClaimed += syncDeckResults.filter((r) => r.claimed).length;
+    const failedSyncDeck = syncDeckResults.find((r) => r.error);
+    if (failedSyncDeck) lastError = failedSyncDeck.error;
+
+    if (!preResult.claimed && extractResults.length === 0 && generateCardsResults.length === 0 && syncDeckResults.length === 0) break; // nothing left to do right now
   }
 
-  console.log('dispatch-import-work: tick complete', { preprocessClaimed, extractClaimed, requeuedStale, elapsedMs: Date.now() - start });
-  return jsonResponse({ ok: true, preprocessClaimed, extractClaimed, requeuedStale, lastError }, 200);
+  console.log('dispatch-import-work: tick complete', { preprocessClaimed, extractClaimed, generateCardsClaimed, syncDeckClaimed, requeuedStale, elapsedMs: Date.now() - start });
+  return jsonResponse({ ok: true, preprocessClaimed, extractClaimed, generateCardsClaimed, syncDeckClaimed, requeuedStale, lastError }, 200);
 });

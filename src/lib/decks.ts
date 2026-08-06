@@ -1,6 +1,6 @@
 import { supabase } from './supabase';
 import { toast } from './dom';
-import type { Deck, DeckStatsWithStreak, DeckTagCount, DeckWithCounts, PublicDeckSearchResult } from '../types';
+import type { Deck, DeckStatsWithStreak, DeckSync, DeckTagCount, DeckWithCounts, PublicDeckSearchResult } from '../types';
 
 /** The short, human-friendly form of a deck id shown in the UI (deck header, search results) — the id's first 8 hex characters, upper-cased. Search-by-id also matches on this prefix (see search_public_decks). */
 export function shortDeckId(id: string): string {
@@ -234,6 +234,47 @@ async function cloneErrorMessage(error: { message: string; context?: unknown }):
     }
   }
   return error.message;
+}
+
+/**
+ * Queues a 'sync_deck' job pulling in whatever's new on the deck this one
+ * was cloned from — new cards, new stacks, even whole new imports — never
+ * touching FSRS state or anything the clone owner already has, never
+ * deleting anything (see supabase/functions/_shared/syncDeckWorker.ts).
+ * Returns the job's id so the caller can poll it, same pattern as
+ * queueGenerateCardsJob.
+ */
+export async function queueDeckSync(deckId: string): Promise<string> {
+  const { data, error } = await supabase.from('jobs').insert({ type: 'sync_deck', deck_id: deckId, payload: { deck_id: deckId } }).select('id').single();
+  if (error) throw error;
+  return data.id;
+}
+
+/** Past sync runs for this deck, newest first — see deck_syncs (written only by the sync_deck worker). */
+export async function listDeckSyncs(deckId: string): Promise<DeckSync[]> {
+  const { data, error } = await supabase.from('deck_syncs').select('*').eq('deck_id', deckId).order('synced_at', { ascending: false });
+  if (error) throw error;
+  return data;
+}
+
+export interface ActiveDeckSyncJob {
+  id: string;
+  status: 'queued' | 'processing';
+}
+
+/** Whether a sync_deck job is still queued/processing for this deck — checked fresh from the DB on every deck-detail load, same reasoning as findActiveJobForPage in pageExtractions.ts (never trust an in-memory flag alone, since navigating away and back would otherwise lose all track of a still-running job). */
+export async function findActiveSyncJob(deckId: string): Promise<ActiveDeckSyncJob | null> {
+  const { data, error } = await supabase
+    .from('jobs')
+    .select('id, status')
+    .eq('type', 'sync_deck')
+    .eq('payload->>deck_id', deckId)
+    .in('status', ['queued', 'processing'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data as ActiveDeckSyncJob | null;
 }
 
 /**

@@ -17,6 +17,8 @@ export interface DeckDetailDeps {
   onImportContent: (deckId: string, deckName: string) => void;
   /** Opens the Manage-content browser for this deck (grouped stacks, status, edit — no study/selection here). */
   onOpenStacks: (deckId: string, deckName: string) => void;
+  /** Opens the "Sync with original deck" page (explanation + action + history) — only ever shown for a deck that's actually a clone. */
+  onOpenDeckSync: (deckId: string) => void;
 }
 
 export async function renderDeckDetail(container: HTMLElement, deckId: string, deps: DeckDetailDeps): Promise<void> {
@@ -77,6 +79,7 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
                             <button class="btn-sec" id="renameDeckBtn">✎ Rename deck</button>
                             <button class="btn-sec" id="togglePublicBtn" ${togglingPublic ? 'disabled' : ''}>${deck.is_public ? '🔒 Make private' : '🌍 Make public'}</button>
                             <button class="btn-sec" id="importContentBtn">📥 Import content</button>
+                            ${deck.cloned_from_deck_id ? `<button class="btn-sec" id="deckSyncBtn">🔄 Resync & History</button>` : ''}
                             <button class="btn-sec" id="deleteDeckBtn">🗑 Delete deck</button>
                           </div>`
                        : ''
@@ -109,6 +112,7 @@ export async function renderDeckDetail(container: HTMLElement, deckId: string, d
       void doTogglePublic();
     });
     document.getElementById('importContentBtn')?.addEventListener('click', () => deps.onImportContent(deck!.id, deck!.name));
+    document.getElementById('deckSyncBtn')?.addEventListener('click', () => deps.onOpenDeckSync(deck!.id));
     document.getElementById('deleteDeckBtn')?.addEventListener('click', () => {
       showOverflowMenu = false;
       showDeleteConfirm = true;
